@@ -13,7 +13,7 @@ import hashlib
 import logging
 import os
 import re
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -557,30 +557,56 @@ def activate_prompt_api(name: str) -> dict[str, Any]:
         git_tools.write_memory_file(file_path, new_text)
         changed_files.append(file_path)
 
-    # Deactivate all prompts of the same task
-    for filepath in glob.glob(os.path.join(prompts_dir, "*.md")):
+    def _commit_changed() -> None:
+        # One activation toggle = a per-file commit for each prompt actually
+        # changed. Stage only the prompts this toggle rewrote, never a repo-wide
+        # `git add prompts/*.md` sweep. Runs on the way out of a failed
+        # activation too, so a rewrite that already reached disk is not left
+        # uncommitted.
+        if config.git.auto_commit:
+            for fp in changed_files:
+                git_tools.commit_memory_file(
+                    fp,
+                    f"palinode: activate prompt {name} for task={task} [{os.path.basename(fp)}]",
+                )
+
+    def _fail_closed(filepath: str, exc: Exception) -> NoReturn:
+        # Fail closed: the target is never activated once any sibling write has
+        # failed, so one task cannot end up with two active prompts. The task
+        # keeps whatever was active before, or nothing, and the caller retries.
+        _commit_changed()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Could not deactivate '{os.path.basename(filepath)}', so "
+                f"'{name}' was not activated: {exc}"
+            ),
+        ) from exc
+
+    # Deactivate all prompts of the same task. Sorted so a failure part-way
+    # through leaves the same files rewritten on every platform.
+    for filepath in sorted(glob.glob(os.path.join(prompts_dir, "*.md"))):
+        resolved = os.path.realpath(filepath)
         try:
-            resolved = os.path.realpath(filepath)
             within = os.path.commonpath([_memory_base_dir(), resolved]) == _memory_base_dir()
-            if not within:
-                continue
+        except ValueError:
+            continue
+        if not within:
+            continue
+        try:
             info = _read_prompt_file(resolved)
             if info["task"] == task and resolved != target_path:
                 _set_active(resolved, False)
-        except Exception:
-            pass
+        except Exception as exc:
+            _fail_closed(resolved, exc)
 
-    # Activate target
-    _set_active(target_path, True)
+    # Activate target last. There is no reliable preflight for a write that
+    # fails, so the real failure goes through the same fail-closed path.
+    try:
+        _set_active(target_path, True)
+    except Exception as exc:
+        _fail_closed(target_path, exc)
 
-    # One activation toggle = a per-file commit for each prompt actually changed
-    # stage only the prompts this toggle rewrote, never a repo-wide
-    # `git add prompts/*.md` sweep.
-    if config.git.auto_commit:
-        for fp in changed_files:
-            git_tools.commit_memory_file(
-                fp,
-                f"palinode: activate prompt {name} for task={task} [{os.path.basename(fp)}]",
-            )
+    _commit_changed()
 
     return {"activated": name, "task": task}
