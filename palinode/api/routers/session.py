@@ -578,7 +578,7 @@ def activate_prompt_api(name: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Could not deactivate '{os.path.basename(filepath)}', so "
+                f"Could not update '{os.path.basename(filepath)}', so "
                 f"'{name}' was not activated: {exc}"
             ),
         ) from exc
