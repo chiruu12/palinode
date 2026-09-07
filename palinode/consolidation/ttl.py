@@ -32,7 +32,7 @@ import re
 from datetime import UTC, datetime, timedelta
 
 from palinode.consolidation.archive import set_archived_frontmatter
-from palinode.core import parser, store, git_tools
+from palinode.core import expiry, parser, store, git_tools
 from palinode.core.config import config
 
 logger = logging.getLogger("palinode.ttl")
@@ -113,21 +113,19 @@ def normalize_expiry(fm: dict, now_iso: str | None = None) -> str | None:
     return None
 
 
-def _coerce_aware(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
-
-
 def is_expired(meta: dict, now: datetime) -> bool:
-    """True iff the memory carries an ``expires_at`` that is at or before ``now``."""
+    """True iff the memory carries an ``expires_at`` that is at or before ``now``.
+
+    Same clock as the act-time gate in :mod:`palinode.core.expiry` — the sweep
+    and the gate cannot disagree on what "expired" means.
+    """
     raw = meta.get("expires_at")
     if not raw:
         return False
-    try:
-        exp = _coerce_aware(datetime.fromisoformat(str(raw)))
-    except (ValueError, TypeError):
+    if expiry.parse_expires_at(raw) is None:
         logger.warning("Unparseable expires_at %r in memory frontmatter — skipping", raw)
         return False
-    return exp <= now
+    return expiry.is_past(raw, now)
 
 
 def _iter_memory_files(root: str):
@@ -150,8 +148,11 @@ def _archive_file(path: str) -> None:
 def archive_expired(now: datetime | None = None, dry_run: bool = False) -> dict:
     """Archive every memory whose ``expires_at`` has passed (ADR-015 §2.3, the TTL/auto-archive work).
 
-    Returns ``{"archived": [relpaths], "count": int, "dry_run": bool}``.
-    Idempotent: a memory already at ``status: archived`` is skipped.
+    Returns ``{"archived": [relpaths], "count": int, "dry_run": bool,
+    "triggers_expired": [trigger ids]}``. Idempotent: a memory already at
+    ``status: archived`` is skipped, and a trigger already disabled is not
+    re-reported. The trigger half rides the same sweep so both acting state
+    types age out on one clock (see :mod:`palinode.core.expiry`).
     """
     now = now or _utc_now()
     root = config.memory_dir
@@ -190,4 +191,13 @@ def archive_expired(now: datetime | None = None, dry_run: bool = False) -> dict:
             except OSError:
                 logger.warning("Failed to auto-archive %s", path, exc_info=True)
 
-    return {"archived": archived, "count": len(archived), "dry_run": dry_run}
+    triggers_expired = store.expire_triggers(now, dry_run=dry_run)
+    for trigger_id in triggers_expired:
+        logger.info("ttl: trigger %s expired — disabled", trigger_id)
+
+    return {
+        "archived": archived,
+        "count": len(archived),
+        "dry_run": dry_run,
+        "triggers_expired": triggers_expired,
+    }

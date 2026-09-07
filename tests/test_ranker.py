@@ -218,3 +218,41 @@ def test_date_window_applied_before_top_k_truncation():
         "date-windowed search must not be defeated by top_k truncating away "
         "the in-window candidates before the window is ever applied"
     )
+
+
+def test_threshold_exempts_vectorless_fts_candidates():
+    """An FTS candidate the store marked ``has_vector=False`` (a chunk with
+    no ``chunks_vec`` row — written FTS-only by a per-input embed rejection
+    or a deferred embed) survives the per-arm floor regardless of
+    its BM25 score: the keyword arm is the only arm it has. A candidate with
+    a vector, or with no flag at all (legacy slate), is floored as before.
+    """
+    fts_only = _res("fts-only.md", score=0.05, has_vector=False)
+    vectored = _res("vectored.md", score=0.05, has_vector=True)
+    legacy = _res("legacy.md", score=0.05)
+    out = _run([], [fts_only, vectored, legacy], threshold=0.5)
+    assert _order(out) == ["fts-only.md"]
+
+
+def test_vectorless_exemption_leaves_vectored_candidates_untouched():
+    """Pin: the exemption changes nothing for chunks that have a vector. The
+    same slate with and without a vectorless FTS-only candidate yields the
+    same vectored survivors, in the same order, with the same scores — the
+    vectorless one simply enters fusion as an ordinary FTS candidate.
+    """
+    strong_vec = _res("strong.md", score=0.7)
+    weak_vec = _res("weak.md", score=0.3, raw_score=0.3)
+    weak_fts_vectored = _res("weak.md", score=0.2, has_vector=True)
+    fts_only = _res("fts-only.md", score=0.02, has_vector=False)
+
+    baseline = _run([strong_vec, weak_vec], [weak_fts_vectored], threshold=0.5)
+    with_fts_only = _run(
+        [strong_vec, weak_vec], [weak_fts_vectored, fts_only], threshold=0.5
+    )
+
+    def _vectored(results):
+        return [(r["file_path"], r["score"]) for r in results if r["file_path"] != "fts-only.md"]
+
+    assert _order(baseline) == ["strong.md"]
+    assert _vectored(with_fts_only) == _vectored(baseline)
+    assert "fts-only.md" in _order(with_fts_only)

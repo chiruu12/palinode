@@ -189,9 +189,13 @@ class EmbeddingInputError(RuntimeError):
 
 # Response-body signatures that prove a 5xx is a per-input model failure, not
 # a backend outage. Ollama returns the NaN-vector case as HTTP 500 with
-# 'failed to encode response: json: unsupported value: NaN'.
+# 'failed to encode response: json: unsupported value: NaN'; llama.cpp's
+# `llama-server --embedding` returns HTTP 500 'input is too large to process.
+# increase the physical batch size' for an input past its batch window —
+# deterministic for that input while the server stays healthy.
 _INPUT_ERROR_PATTERNS = (
     "unsupported value: nan",
+    "input is too large to process",
 )
 
 
@@ -259,6 +263,42 @@ def _extract_embedding_batch(
     return normalized
 
 
+def _extract_openai_embedding_batch(
+    data: Any,
+    *,
+    expected_count: int,
+) -> list[list[float]] | None:
+    """Return a complete, input-ordered ``/v1/embeddings`` batch or ``None``.
+
+    The OpenAI shape is ``{"data": [{"index": i, "embedding": [...]}, ...]}``.
+    Servers are allowed to return items out of order, so when every item
+    carries an ``index`` the batch is re-sorted by it; a missing or duplicate
+    ``index`` fails closed rather than guessing. Vector validation matches
+    :func:`_extract_embedding_batch` (non-empty, numeric, consistent
+    dimensions, one per input) so a partial batch never reaches a caller.
+    """
+    if not isinstance(data, dict):
+        return None
+    items = data.get("data")
+    if not isinstance(items, list) or len(items) != expected_count:
+        return None
+
+    ordered: list[Any] = [None] * expected_count
+    indices = [item.get("index") if isinstance(item, dict) else None for item in items]
+    if all(isinstance(i, int) and not isinstance(i, bool) for i in indices):
+        if sorted(indices) != list(range(expected_count)):
+            return None
+        for item, i in zip(items, indices, strict=True):
+            ordered[i] = item
+    elif any(i is not None for i in indices):
+        return None
+    else:
+        ordered = list(items)
+
+    vectors = [item.get("embedding") if isinstance(item, dict) else None for item in ordered]
+    return _extract_embedding_batch({"embeddings": vectors}, expected_count=expected_count)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Roles — the per-endpoint routing that makes misroutes impossible
 # ──────────────────────────────────────────────────────────────────────────
@@ -297,6 +337,27 @@ def _resolve_base_url(role: OllamaRole) -> str:
         url = getattr(consolidation, "llm_url", None) if consolidation else None
         return url or getattr(config.auto_summary, "ollama_url", None) or primary
     return primary  # pragma: no cover — exhaustive above
+
+
+def _embed_dialect() -> str:
+    """The configured embed wire dialect (``"ollama"`` or ``"openai"``), read live."""
+    return config.embeddings.primary.dialect
+
+
+_OPENAI_EMBED_PATH = "/v1/embeddings"
+
+
+def _openai_embed_base_url() -> str:
+    """The EMBED host with any trailing ``/v1`` removed.
+
+    OpenAI-style servers are commonly configured as ``http://host:8080/v1``
+    (the way an OpenAI SDK ``base_url`` is written); the request path already
+    carries ``/v1``, so strip it once rather than emitting ``/v1/v1/embeddings``.
+    """
+    base = _resolve_base_url(OllamaRole.EMBED).rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -623,8 +684,16 @@ class OllamaClient:
                         retry_count=attempt, circuit_state=cb.state.value,
                         outcome=f"http_{status}", op=op, level=logging.WARNING,
                     )
+                    # Carry the server's own explanation: an OpenAI-style 400
+                    # body names the rejected input, and `str(e)` alone is just
+                    # the status line plus an MDN link.
+                    try:
+                        body_4xx = (e.response.text or "").strip()[:300]
+                    except Exception:
+                        body_4xx = ""
                     raise OllamaError(
-                        f"Ollama returned HTTP {status} for {op} (role={role.value}): {e}",
+                        f"Ollama returned HTTP {status} for {op} (role={role.value}): {e}"
+                        + (f" body={body_4xx!r}" if body_4xx else ""),
                         role=role.value, model=model, status_code=status,
                     ) from e
                 # A 5xx whose body names a per-input model failure (bge-m3
@@ -743,6 +812,8 @@ class OllamaClient:
         key ``input``) and falls back to the legacy ``/api/embeddings`` (key
         ``prompt``) **only** on a 404 (API-version mismatch). Parses either
         response shape (``embeddings`` list-of-lists or legacy ``embedding``).
+        With ``embeddings.primary.dialect: openai`` the call is routed to
+        :meth:`_embed_openai` (``/v1/embeddings``) instead, same contract.
 
         Raises:
             EmbeddingContextError: when Ollama reports a context-window overflow
@@ -761,6 +832,10 @@ class OllamaClient:
             config.embeddings.primary.timeout_seconds,
             connect=config.embeddings.primary.connect_timeout_seconds,
         )
+        if _embed_dialect() == "openai":
+            return self._embed_openai(
+                [text], model=mdl, timeout=tmo, retries=retries, op="embed",
+            )[0]
         last_exc: OllamaError | None = None
         for endpoint, payload_key in (("/api/embed", "input"), ("/api/embeddings", "prompt")):
             try:
@@ -820,7 +895,9 @@ class OllamaClient:
         valid for the entire batch. Older Ollama versions that return 404 for
         ``/api/embed`` retain compatibility through the scalar legacy fallback.
 
-        An empty input is a no-op and performs no network request.
+        An empty input is a no-op and performs no network request. With
+        ``embeddings.primary.dialect: openai`` the batch goes to
+        :meth:`_embed_openai` as one ``/v1/embeddings`` call.
         """
         if not texts:
             return []
@@ -830,6 +907,10 @@ class OllamaClient:
             config.embeddings.primary.timeout_seconds,
             connect=config.embeddings.primary.connect_timeout_seconds,
         )
+        if _embed_dialect() == "openai":
+            return self._embed_openai(
+                texts, model=mdl, timeout=tmo, retries=retries, op="embed_many",
+            )
         try:
             data = self._request_json(
                 OllamaRole.EMBED,
@@ -886,6 +967,80 @@ class OllamaClient:
             f"returned_count={returned_count})",
             role="embed",
             model=mdl,
+        )
+
+    def _embed_openai(
+        self, texts: list[str], *, model: str,
+        timeout: float | httpx.Timeout, retries: int | None, op: str,
+    ) -> list[list[float]]:
+        """Embed ``texts`` through an OpenAI-compatible ``/v1/embeddings`` server.
+
+        The ``embeddings.primary.dialect: openai`` path for llama.cpp / vLLM /
+        LM Studio. One POST of ``{"model", "input": [...]}``
+        under the EMBED role, so it shares the Ollama path's circuit breaker,
+        retry/backoff, metrics, and structured logging by construction. There
+        is no legacy-endpoint fallback here — the OpenAI shape has only one
+        endpoint — and no ``/api/show`` preflight (see ``embedder``).
+
+        Error mapping keeps the caller contract identical to the Ollama path:
+
+        * HTTP 400 — by OpenAI convention ``invalid_request_error``. The
+          payload is fixed apart from the input, so this is the server
+          rejecting *this input* (vLLM's over-length reply, for one) →
+          :class:`EmbeddingInputError`: no retry, no breaker hit, the chunk
+          stays keyword-searchable and is re-embedded on the next pass.
+        * a 5xx whose body names a per-input failure (llama.cpp's "input is
+          too large to process") → :class:`EmbeddingInputError`, same reasons.
+        * anything else (401/404, timeouts, 5xx exhausted, circuit open,
+          malformed body) → the usual :class:`OllamaError` family, which the
+          embedder wraps as ``EmbeddingUnavailable``.
+
+        :class:`EmbeddingContextError` is not raised on this path: it is the
+        typed form of Ollama's HTTP-200 error body, which these servers do
+        not emit.
+        """
+        text_len = sum(len(text) for text in texts)
+        try:
+            data = self._request_json(
+                OllamaRole.EMBED, _OPENAI_EMBED_PATH, {"model": model, "input": texts},
+                timeout=timeout, retries=retries, model=model, op=op,
+                base_url=_openai_embed_base_url(),
+            )
+        except OllamaInputError as e:
+            raise EmbeddingInputError(
+                model=model, text_len=text_len, ollama_message=str(e)
+            ) from e
+        except OllamaError as e:
+            if e.status_code == 400:
+                raise EmbeddingInputError(
+                    model=model, text_len=text_len, ollama_message=str(e)
+                ) from e
+            raise
+
+        embeddings = _extract_openai_embedding_batch(data, expected_count=len(texts))
+        if embeddings is not None:
+            self._embed_ok_once = True
+            return embeddings
+
+        keys = sorted(data.keys()) if isinstance(data, dict) else []
+        raw_items = data.get("data") if isinstance(data, dict) else None
+        returned_count = len(raw_items) if isinstance(raw_items, list) else None
+        event_logger.warning(json.dumps({
+            "event": "embed_unexpected_shape",
+            "op": op,
+            "role": "embed",
+            "endpoint": _OPENAI_EMBED_PATH,
+            "model": model,
+            "response_keys": keys,
+            "expected_count": len(texts),
+            "returned_count": returned_count,
+        }, sort_keys=True))
+        raise OllamaError(
+            f"unexpected embed response shape from {_OPENAI_EMBED_PATH} "
+            f"(response_keys={keys}, expected_count={len(texts)}, "
+            f"returned_count={returned_count})",
+            role="embed",
+            model=model,
         )
 
     def generate(

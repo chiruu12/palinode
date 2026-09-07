@@ -26,6 +26,9 @@ stats dict:
     "retracted": 0,
     "merge_rejected": 0,
     "protected_rejected": 0,
+    "contradicts_proposed": 0,
+    "unmatched": 0,
+    "review_flagged": 0,
 }
 ```
 
@@ -104,13 +107,13 @@ removing one leading `- ` or `* ` list marker if present.
 
 | Field | Contract |
 | --- | --- |
-| Required fields | Non-empty `ids`, `new_text`. |
+| Required fields | Non-empty `ids`, `new_text`. Optional `rationale` or `reason`; `rationale` wins when both are present. |
 | Preconditions | `ids[0]` matches a list-item fact in current content. If `nightly_policy=True`, every source ID must match a fact whose text starts with `[YYYY-MM-DD]`, and all extracted dates must be identical. |
 | Postconditions | The first source fact is updated with normalized `new_text`, then its marker is rewritten from `<!-- fact:<ids[0]> -->` to `<!-- fact:merged-<ids[0]> -->`. For each remaining source ID, every matching single-line list item is removed. |
 | Source removal | Source facts after the first ID are removed from the main file. The first source remains as the merged fact with the `merged-` ID. If a remaining source ID appears on multiple matching list-item lines, all matching lines are removed. |
-| History | None. |
+| History | Before mutation, every source fact's original text is appended verbatim to the corresponding history file — one entry per retired line, tagged with that source's own fact ID: `Merged into merged-<ids[0]> (YYYY-MM-DD): <old_text> (reason: <reason>) <!-- fact:<source-id> -->`. `ids[0]` is recorded with its pre-merge text (its text is replaced in place); each removed `ids[1:]` line is recorded (a duplicate-ID line is recorded once per line). Source IDs that match nothing produce no entry. A no-op MERGE writes no history. |
 | Stats | `merged += 1` only if content changed. With nightly rejection, `merge_rejected += 1`. |
-| Failure behavior | Missing or empty `ids`, missing or empty `new_text`, or no match for `ids[0]` produces a silent no-op. Source IDs after the first that do not match are ignored. |
+| Failure behavior | Missing or empty `ids`, missing or empty `new_text`, or no match for `ids[0]` produces a silent no-op with no history append. Source IDs after the first that do not match are ignored. |
 
 ### SUPERSEDE
 
@@ -218,7 +221,7 @@ When `nightly_policy=False`, this guard is not applied.
 | --- | --- |
 | `KEEP` | Stable; increments `kept` each time. |
 | `UPDATE` | Stable when reapplying the same replacement to the same retained ID. If the second replacement would not change content, `updated` does not increment on that second run. |
-| `MERGE` | Not generally re-runnable. The first run rewrites `ids[0]` to `merged-<ids[0]>`, so a second run using the original IDs usually cannot match the first source ID and becomes a silent no-op. Remaining source facts may already be removed. |
+| `MERGE` | Not generally re-runnable. The first run rewrites `ids[0]` to `merged-<ids[0]>`, so a second run using the original IDs usually cannot match the first source ID and becomes a silent no-op with no history append. Remaining source facts may already be removed. |
 | `SUPERSEDE` | Not a pure no-op. The original fact ID remains on the tombstoned line, so the same operation can match it again, wrap the already tombstoned text again, insert another `supersedes-<id>` line, append history again, and increment `superseded` again. |
 | `ARCHIVE` | Usually becomes a no-op after the first run because the source line is removed. |
 | `RETRACT` | Not a pure no-op. The original fact ID remains on the tombstoned line, so the same operation can tombstone the already tombstoned text again, append history again, and increment `retracted` again. |
@@ -234,9 +237,11 @@ file, replace the target via `os.replace`, and fsync the target directory. On
 write failure, the temporary file is removed when possible and the exception is
 raised.
 
-`ARCHIVE`, `SUPERSEDE`, and `RETRACT` preserve history in a sibling history
-file. The history path is derived by stripping a trailing `-status.md` or `.md`
-from `file_path` and appending `-history.md`.
+`MERGE`, `ARCHIVE`, `SUPERSEDE`, and `RETRACT` preserve history in a sibling
+history file — every op that retires a fact's current text writes to the
+sibling, so the main file plus its history sibling are together lossless
+without recourse to git. The history path is derived by stripping a trailing
+`-status.md` or `.md` from `file_path` and appending `-history.md`.
 
 History entries are timestamped with current UTC to minute precision:
 
@@ -259,10 +264,49 @@ append. If they have no frontmatter, archived frontmatter is prepended. If they
 have frontmatter but no `status:` field, `status: archived` is injected. If
 they already have any `status:` field, that explicit status is preserved.
 
-`apply_operations` does not create git commits. Git commit behavior belongs to
-caller-layer paths such as the consolidation runner and write-time dedup flow.
-The returned stats dict is the executor's auditable record of what happened
-inside this call.
+`apply_operations` does not create git commits for the target file or its
+history sibling. Git commit behavior for those belongs to caller-layer paths
+such as the consolidation runner and write-time dedup flow. The one exception
+is dependency propagation (next section), whose writes land in other files and
+are committed by the propagation step itself. The returned stats dict is the
+executor's auditable record of what happened inside this call.
+
+## Dependency Propagation (`backed_by`)
+
+Typed links carry two different propagation semantics. `backed_by` is an
+extension edge — a dependent's claim rests on its source, so retiring the
+source must reach the dependent. `contradicts` is an association edge — two
+memories disagree, neither wins — and is surfaced by `lint`, never propagated.
+
+After the main file is written, if any `SUPERSEDE`, `ARCHIVE`, `RETRACT` or
+`MERGE` in the call changed content, the executor flags every dependent of the
+target file (`palinode.consolidation.propagate.flag_dependents`):
+
+| Field | Contract |
+| --- | --- |
+| Trigger | At least one retiring op (`SUPERSEDE` / `ARCHIVE` / `RETRACT` / `MERGE`) incremented its stat in this call. A rejected, unmatched, or dropped op does not trigger propagation. |
+| Source ref | The target file's memory-dir-relative path without `.md` (`project/foo` for `project/foo.md`). A `-status.md` layer is matched and recorded under its base ref (`project/foo` for `project/foo-status.md`), the identity the history writer uses. A target outside the memory dir has no dependents. |
+| Dependents | Every `.md` under the memory dir whose frontmatter `backed_by` names the source ref (with or without `.md`), excluding the source itself, `-history.md` siblings, skip-dir files (`archive/`, `logs/`, `daily/`, `inbox/`, `prompts/`, `.obsidian/`), unreadable frontmatter, and `status: archived` memories. Scanned in sorted path order. |
+| Write | One `stale_backing` entry is appended to the dependent's frontmatter list: `{ref: <source ref>, op: <kinds>, at: <UTC ISO-8601 seconds>, facts: [<retired ids>], reason: <joined reasons>}`. `op` is the retirement kinds that fired, lowercase, joined by `, ` in the order supersede, archive, retract, merge. `facts` and `reason` are omitted when empty. The body and every other frontmatter field are preserved; `status` is never changed. |
+| Idempotency | Keyed on `ref`: a dependent already carrying an entry for this source is not written, not re-indexed, not committed. Re-applying the same ops therefore flags nothing on the second run. |
+| Hops | One. Dependents of dependents are not walked. |
+| Index | Each written dependent is re-indexed through the frontmatter-only path (no re-embed) so the flag appears in search-result metadata. |
+| Git | All written dependents are staged and committed in one commit, `<prefix> backed_by review: <source ref> <kinds> -> N dependent(s)`, when `git.auto_commit` is on. |
+| Stats | `review_flagged` = number of dependents newly written in this call. |
+| Failure behavior | Best-effort per dependent: a dependent that cannot be read or written is logged and skipped; propagation never fails the retirement that triggered it. |
+| Clearing | Re-saving the dependent through any save surface rebuilds its frontmatter and drops the flag. No executor op clears it. |
+
+The on-demand `archive_memory` (archive / supersede of a whole file) and
+`retract_mentions` (strand-level retract) paths apply the same rule after
+their own commit, with `op` = `archive` / `supersede` / `retract`, and report
+the flagged rel paths as `review_flagged` in their result dicts. The TTL sweep
+does not propagate. Because archived dependents are skipped, `restore_memory`
+re-runs the one-hop check from the other side: on restore, each of the restored
+memory's own `backed_by` refs whose target is no longer active (`status:
+archived`, with or without `superseded_by`, or no file at `<ref>.md` /
+`<ref>-status.md`) gains an entry with `op` = `restore-check` and a `reason`
+naming the observed state, keyed on `ref` like every other entry, written and
+committed in the restore itself and reported as `stale_backing` in its result.
 
 ## Divergence Notes
 

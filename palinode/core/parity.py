@@ -395,6 +395,52 @@ REGISTRY: tuple[Operation, ...] = (
         api_endpoint=("POST", "/archive"),
         known_drift={},
     ),
+    # ── restore (inverse of archive, every archive path) ─────────────
+    # The other half of "archival is reversible": brings one archived
+    # memory back into default recall, reconstructing frontmatter from the
+    # archived file itself and carrying `restored_at` / `restored_from`
+    # provenance. Plugin-exempt like `archive`.
+    Operation(
+        name="restore",
+        canonical_params=(
+            CanonicalParam(name="file_path", type="string", required=True),
+            CanonicalParam(name="reason", type="string"),
+        ),
+        cli_command="restore",
+        mcp_tool="palinode_restore",
+        api_endpoint=("POST", "/restore"),
+        known_drift={},
+    ),
+    # ── unretract (inverse of mention-level retraction) ───────────────
+    # `pref` names the retraction: the marker id is a function of the
+    # normalized pref, so the phrase (as recorded in the history sibling)
+    # identifies exactly its own struck spans and `retracted_prefs` entry.
+    Operation(
+        name="unretract",
+        canonical_params=(
+            CanonicalParam(name="file_path", type="string", required=True),
+            CanonicalParam(name="pref", type="string", required=True),
+            CanonicalParam(name="reason", type="string"),
+        ),
+        cli_command="unretract",
+        mcp_tool="palinode_unretract",
+        api_endpoint=("POST", "/unretract"),
+        known_drift={},
+    ),
+    # ── forget-withdraw (take a forget request back) ──────────────────
+    # A composition of restore + unretract over the request's targets plus
+    # archival of the request record(s); `file_path` is the request memory.
+    Operation(
+        name="forget_withdraw",
+        canonical_params=(
+            CanonicalParam(name="file_path", type="string", required=True),
+            CanonicalParam(name="reason", type="string"),
+        ),
+        cli_command="forget-withdraw",
+        mcp_tool="palinode_forget_withdraw",
+        api_endpoint=("POST", "/forget-withdraw"),
+        known_drift={},
+    ),
     # ── archive-expired (ADR-015 §2.3 TTL sweep) ──────────────────────
     Operation(
         name="archive_expired",
@@ -427,6 +473,9 @@ REGISTRY: tuple[Operation, ...] = (
                 type="integer",
                 default_key="TRIGGER_COOLDOWN_HOURS_DEFAULT",
             ),
+            # Acting-state expiry + authority (palinode.core.expiry).
+            CanonicalParam(name="expires_at", type="string"),
+            CanonicalParam(name="authority", type="string"),
         ),
         cli_command="trigger add",
         mcp_tool="palinode_trigger",

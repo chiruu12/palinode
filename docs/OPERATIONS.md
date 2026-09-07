@@ -198,6 +198,20 @@ palinode rollback path/to/file.md
 
 Or use the MCP tools from your IDE — `palinode_history`, `palinode_blame`, `palinode_rollback` do the same thing.
 
+### Status documents have rotted
+
+**Symptoms:** a `projects/*-status.md` whose Consolidation Log has grown to hundreds of blank-rationale entries, whose frontmatter counts and dates disagree with its body, or whose `entities:` list carries `<!-- fact:… -->` residue; entity lookups return fragmented refs.
+
+```bash
+# Report what would change (dry run — the default)
+palinode repair-status
+
+# Repair the status documents, and strip stray fact markers from every other file's frontmatter
+palinode repair-status --scope all --execute
+```
+
+Nothing is committed — review the diff and commit it yourself. The index is repointed as part of `--execute`; a follow-up `palinode reindex` is not needed. Full option list in [CLI.md](CLI.md#palinode-repair-status).
+
 ---
 
 ## Maintenance

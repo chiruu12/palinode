@@ -423,6 +423,23 @@ it), and don't rely on it as the authoritative link set — `entities:` remains 
 authoritative, typed surface. `cross_refs` is additive recall signal, always safe
 because it only ever reflects what the body literally mentions.
 
+### Typed links carry two different propagation semantics
+
+- **`backed_by` is an extension edge.** "B is backed by A" means B's claim rests
+  on A, so a change to A can entail a change to B. When A is superseded,
+  archived, retracted or merged away — by the consolidation executor or the
+  on-demand archive/retract ops — every live memory citing A gains a
+  `stale_backing:` frontmatter entry (source ref, retirement kind, retired fact
+  ids, reason, timestamp). That is a **flag for review, not a rewrite**: B stays
+  active and in recall, `lint` and the quality UI list it, search results mark
+  it. One hop; deterministic; idempotent per source. Re-saving B — after
+  re-verifying it against A's `-history.md` entry — clears the flag, because a
+  save rebuilds frontmatter from its inputs. Do not hand-edit `stale_backing:`;
+  either re-save the dependent or supersede/retract it.
+- **`contradicts` is an association edge.** Two memories disagree and neither
+  wins. It is surfaced (`lint` `open_contradictions`) and never propagated;
+  only `SUPERSEDE` picks a winner.
+
 ### What NOT to do
 
 - **Don't auto-generate dozens of wikilinks for incidental references.** A link is load-bearing when the linked entity has its own continuity (a person you'll meet again, a project that has a status). One-off mentions — a tool you used once, a city Alice flew through — should stay as plain text. Over-linking poisons the graph view and inflates the entity set without adding signal.
@@ -550,6 +567,15 @@ Files with `core: true` in frontmatter are loaded at EVERY session start without
 - Research references
 - Historical insights
 - People you haven't interacted with in 30+ days
+
+### Acting state carries an expiry
+
+`core: true` memories and prospective triggers are the two kinds of record that *act* — injected or fired without anyone asking. A record may influence an action only under a current, unrevoked authority, so both carry:
+
+- `expires_at` — ISO-8601. Past it the record stays stored and searchable but no longer acts (not injected, not fired). Same clock as the ephemeral TTL sweep; set via `metadata.expires_at` / `metadata.ttl` on a memory, `expires_at` on a trigger.
+- `authority` — free text naming who or what licensed it: a user grant, a session id, a policy name. Stored and displayed, not enforced.
+
+Prefer a `core: true` with an `expires_at` and a review date over one that acts forever; `palinode lint` lists the ones that have none.
 
 ### Review core set monthly
 

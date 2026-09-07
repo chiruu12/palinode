@@ -140,6 +140,18 @@ def lint(fmt, deep_contradictions, max_llm_calls, similarity_threshold):
 
     console.print("")
 
+    missing_expiry = data.get("missing_expiry", [])
+    if missing_expiry:
+        console.print(
+            f"[bold yellow]Core memories without expires_at ({len(missing_expiry)})[/bold yellow]"
+        )
+        for path in missing_expiry:
+            console.print(f"  - {path}", markup=False)
+    else:
+        console.print("[green]✓ All core memories carry an expires_at[/green]")
+
+    console.print("")
+
     wiki_drift = data.get("wiki_drift", [])
     if wiki_drift:
         console.print(f"[bold yellow]Wiki Drift ({len(wiki_drift)})[/bold yellow]")
@@ -202,6 +214,20 @@ def lint(fmt, deep_contradictions, max_llm_calls, similarity_threshold):
             console.print(f"  - {oc['file']} contradicts: {refs}")
     else:
         console.print("[green]✓ No open contradictions[/green]")
+    # A `backed_by` source was superseded / retracted / archived / merged away;
+    # the dependent is still live and wants re-verifying (re-save clears it).
+    stale_backing = data.get("stale_backing", [])
+    if stale_backing:
+        console.print(
+            f"[bold yellow]Stale Backing ({len(stale_backing)})[/bold yellow]"
+        )
+        for sb in stale_backing:
+            bits = ", ".join(
+                f"{e.get('ref')} ({e.get('op')})" for e in sb.get("stale_backing", [])
+            )
+            console.print(f"  - {sb['file']} backed by: {bits}")
+    else:
+        console.print("[green]✓ No stale backing (review pending)[/green]")
 
     # Refs that look like aliases of one another. A split entity makes every
     # lookup return a plausible, non-empty, INCOMPLETE result — under-recall that

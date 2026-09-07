@@ -64,7 +64,7 @@ the UI listen on the remote machine's LAN interface.
 | Fact detail | `/ui/memory/<category>/<slug>` | What does this memory say, what metadata does it carry, and what provenance is available? |
 | Diffs | `/ui/diffs` | Which memory files changed in recent Git commits? |
 | Compaction | `/ui/compaction` | Which consolidation passes ran, and which archived-fact history files exist? |
-| Quality | `/ui/quality` | Which memories are stale, orphaned, missing descriptions, contradictory, or missing extraction metadata? |
+| Quality | `/ui/quality` | Which memories are stale, orphaned, missing descriptions, contradictory, missing extraction metadata, or resting on a retired `backed_by` source? |
 
 ### Dashboard
 
@@ -148,12 +148,16 @@ Quality presents the current lint findings as linkable queues:
 - stale active memories;
 - orphaned memories with no entity relationship or inbound reference;
 - memories missing a one-line description;
-- contradictory active memories; and
-- memories whose extraction provenance is not yet captured.
+- contradictory active memories;
+- memories whose extraction provenance is not yet captured; and
+- memories with stale backing — a `backed_by` source that was superseded,
+  retracted, archived or merged away. The row names the retired source and how
+  it was retired; re-saving the memory clears it.
 
 The sidebar badge counts the actionable stale, orphaned, missing-description,
-and contradiction queues. It intentionally excludes the extraction-metadata
-queue while that metadata is not captured for ordinary memories.
+contradiction, and stale-backing queues. It intentionally excludes the
+extraction-metadata queue while that metadata is not captured for ordinary
+memories.
 
 ## Read-only and access boundaries
 

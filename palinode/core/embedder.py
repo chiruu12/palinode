@@ -113,13 +113,25 @@ def _notice_keyword_only_once() -> None:
         if _keyword_only_notice_done:
             return
         _keyword_only_notice_done = True
+    if config.embeddings.primary.dialect == "openai":
+        fix = (
+            "confirm the OpenAI-compatible server at embeddings.primary.url "
+            "answers POST /v1/embeddings for this model (llama.cpp: "
+            "`llama-server --embedding`; vLLM / LM Studio: the model is loaded)"
+        )
+    else:
+        fix = (
+            "`ollama pull bge-m3` (or point embeddings.primary.url at a working "
+            "Ollama host)"
+        )
     logger.warning(
         "Embeddings unavailable — running in keyword-only mode (BM25/FTS5). "
         "Save, search, and audit still work; semantic recall is off until an "
-        "embedder is reachable. To enable it: `ollama pull bge-m3` (or point "
-        "embeddings.primary.url at a working Ollama host). "
-        "op=embed outcome=keyword_only_mode model=%s",
+        "embedder is reachable. To enable it: %s. "
+        "op=embed outcome=keyword_only_mode model=%s dialect=%s",
+        fix,
         config.embeddings.primary.model,
+        config.embeddings.primary.dialect,
     )
 
 
@@ -139,6 +151,18 @@ def check_model_context(
     """
     if model is None:
         model = config.embeddings.primary.model
+
+    dialect = config.embeddings.primary.dialect
+    if dialect != "ollama":
+        # /api/show is Ollama-native; an OpenAI-compatible server (llama.cpp,
+        # vLLM, LM Studio) has no equivalent, so the ctx guard is simply not
+        # available there. Skip rather than log a spurious "check skipped".
+        logger.debug(
+            "embed preflight: /api/show not available for dialect=%s — skipping "
+            "op=preflight model=%s",
+            dialect, model,
+        )
+        return
 
     try:
         # Phase 3: route /api/show through the centralized client (EMBED

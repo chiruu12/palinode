@@ -392,6 +392,28 @@ Per type, enterprise:
   context cap (60k vs 40k) moved 43.3 → 38.8 on web. The 9B reader with a 20k thinking budget
   is the constant every system in the table shares, and it is the largest source of variance.
 
+### The BM25 arm, measured (added 2026-09-05)
+
+The rows above run the adapter's OR-joined BM25 arm (`fts_mode: "or"`): any content word of
+the question may match. The store's stock path is FTS5's implicit AND — every remaining token
+must co-occur in the chunk — which for a question-shaped query usually returns an empty BM25
+slate and leaves hybrid search vector-only. Whether that costs anything was an open question,
+previously closed on LongMemEval-S evidence that the vector arm carried recall. One row,
+same store, same reader, judge and budget, the stock path switched on (`--palinode-fts-mode and`):
+
+| web (240), notes 6 + slices 6 ±1 | overall | static | dynamic | procedure | gotchas | abstention |
+|---|---|---|---|---|---|---|
+| OR-joined BM25 arm (row above) | 48.3 | 51.7 | 49.0 | 73.8 | 26.7 | 34.7 |
+| stock implicit-AND path | 42.5 | 43.3 | 41.2 | 66.7 | 33.3 | 30.6 |
+
+−5.8 overall, 27 questions lost to 13 won, UNKNOWN up from 63 to 84 — with the same six
+notes and within one slice of the same context size, so this is retrieval, not budget. The
+three large types each lose 7–8 points; the two small types that move up are 15 and 20
+questions. Single seed, so the number is a signal and not a citation, but it clears the
+noise floor in the direction the closure said it wouldn't: on questions that name an exact
+UI label, the BM25 arm is doing work the vector arm does not. Artifacts:
+`bench/results/longmemeval-v2-palinode-web-notes6-slices6-r1-ftsand-2026-09-05/`.
+
 ### Against the leaderboard
 
 LME-V2's leaderboard scores LAFS gain over a fixed reference frontier — accuracy integrated

@@ -207,7 +207,7 @@ This checks 18+ conditions — DB path validity, watcher connectivity, config co
 
 ## Obsidian integration
 
-Palinode stores everything as plain markdown with YAML frontmatter, so your Palinode directory is already a valid Obsidian vault. Run `palinode init --obsidian /path/to/vault` for an opinionated scaffold (graph defaults, daily-notes wiring, a starter `_index.md` MOC), then open the directory in Obsidian. You get the graph view, backlinks, and Bases on top of Palinode's hybrid search and consolidation — same files, two surfaces.
+Palinode stores everything as plain markdown with YAML frontmatter, so your Palinode directory is already a valid Obsidian vault. Run `palinode init --obsidian --dir /path/to/vault` for an opinionated scaffold (graph defaults, daily-notes wiring, a starter `_index.md` MOC), then open the directory in Obsidian. You get the graph view, backlinks, and Bases on top of Palinode's hybrid search and consolidation — same files, two surfaces.
 
 See [OBSIDIAN.md](OBSIDIAN.md) for the comprehensive guide: quickstart, the wiki-maintenance contract, the embedding tools the LLM calls (`palinode_dedup_suggest`, `palinode_orphan_repair`), and migration paths.
 ## Connecting your IDE via MCP

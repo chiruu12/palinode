@@ -158,18 +158,76 @@ type PalinodeConfig = {
   recallProfileConfig?: Partial<RecallProfileConfig>;  // per-field override over the named preset
 };
 
-// Config schema follows standard OpenClaw plugin pattern
-const _palinodeConfigSchema = Type.Object({
-  palinodeApiUrl: Type.String({ default: DEFAULTS.palinodeApiUrl }),
-  palinodeDir: Type.String({ default: DEFAULTS.palinodeDir }),
-  promptsDir: Type.String({ default: DEFAULTS.promptsDir }),
-  autoCapture: Type.Boolean({ default: DEFAULTS.autoCapture }),
-  autoRecall: Type.Boolean({ default: DEFAULTS.autoRecall }),
-  recallProfile: Type.String({ default: DEFAULTS.recallProfile }),
-});
+/** `{ type: "string", enum: [...] }` — the JSON Schema shape OpenClaw's bundled manifests use. */
+function stringEnum<T extends string>(values: readonly T[], description: string) {
+  return Type.Unsafe<T>({ type: "string", enum: [...values], description });
+}
+
+const MID_TURN_MODES = ["none", "summary", "full"] as const;
+
+const RECALL_SOURCES = ["core", "semantic", "associative", "triggers"] as const satisfies readonly RecallSource[];
+
+const recallProfileConfigSchema = Type.Object(
+  {
+    sources: Type.Optional(Type.Array(stringEnum(RECALL_SOURCES, "Recall source"))),
+    coreMaxCharsPerFile: Type.Optional(Type.Number()),
+    coreBudget: Type.Optional(Type.Number()),
+    semanticLimit: Type.Optional(Type.Number()),
+    semanticMaxChars: Type.Optional(Type.Number()),
+    associativeLimit: Type.Optional(Type.Number()),
+    associativeMaxChars: Type.Optional(Type.Number()),
+    triggersLimit: Type.Optional(Type.Number()),
+    triggersMaxCharsEach: Type.Optional(Type.Number()),
+    typeAllow: Type.Optional(Type.Array(Type.String())),
+    typeDeny: Type.Optional(Type.Array(Type.String())),
+    totalBudget: Type.Optional(Type.Number()),
+  },
+  {
+    additionalProperties: false,
+    description: "Per-field overrides applied on top of the named recall preset",
+  },
+);
+
+/**
+ * The single source of truth for the plugin's config surface.
+ *
+ * `openclaw.plugin.json`'s `configSchema` is GENERATED from this object
+ * (`npm run manifest`; `test/manifest.test.ts` fails when the committed copy
+ * drifts). The OpenClaw host validates `plugins.entries.<id>.config` against
+ * the manifest copy with Ajv before the plugin module is even loaded, so a key
+ * accepted by `parse()` below but missing here is rejected at load time.
+ *
+ * Every property is optional and none carries a `default`: `parse()` owns the
+ * defaults, and `palinodeDir`'s default is resolved from `$HOME` at runtime —
+ * it cannot be a static string in a manifest, and the host applies manifest
+ * defaults (`useDefaults`) to the user's config.
+ */
+export const PALINODE_CONFIG_SCHEMA = Type.Object(
+  {
+    palinodeApiUrl: Type.Optional(Type.String({ description: "Palinode API server URL" })),
+    palinodeDir: Type.Optional(Type.String({ description: "Path to the Palinode memory directory" })),
+    promptsDir: Type.Optional(
+      Type.String({ description: "Path to extraction prompts, relative to palinodeDir" }),
+    ),
+    autoCapture: Type.Optional(
+      Type.Boolean({ description: "Append session summaries to daily/ at agent end" }),
+    ),
+    autoRecall: Type.Optional(
+      Type.Boolean({ description: "Inject core memory + semantic recall before each agent turn" }),
+    ),
+    midTurnMode: Type.Optional(
+      stringEnum(MID_TURN_MODES, "Core-memory injection on turns after the first: none, summary lines, or full files"),
+    ),
+    recallProfile: Type.Optional(
+      stringEnum(Object.keys(PROFILES) as RecallProfileName[], "Named recall preset"),
+    ),
+    recallProfileConfig: Type.Optional(recallProfileConfigSchema),
+  },
+  { additionalProperties: false },
+);
 
 const palinodeConfigSchema = {
-  ..._palinodeConfigSchema,
+  ...PALINODE_CONFIG_SCHEMA,
   parse(value: unknown): PalinodeConfig {
     const cfg = (value || {}) as Record<string, unknown>;
     const profileName = (typeof cfg.recallProfile === "string" && (cfg.recallProfile as string) in PROFILES)

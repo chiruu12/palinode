@@ -491,6 +491,9 @@ DISPATCH_ERROR_PREFIXES: tuple[str, ...] = (
     "Consolidation failed",
     "Archive failed",
     "Archive-expired sweep failed",
+    "Restore failed",
+    "Unretract failed",
+    "Forget-withdraw failed",
     "Push failed",
     "Ingest failed",
     # Not emitted by a `_text(...)` call at all — `_timeout_message()` builds it
@@ -693,6 +696,15 @@ def _format_results(results: list[dict[str, Any]], full: bool = False) -> str:
             _link_bits.append("⚠ contradicts: " + ", ".join(contradicts))
         if backed_by:
             _link_bits.append("backed by: " + ", ".join(backed_by))
+        # A source this hit rests on was retired; the reader needs to know the
+        # support was withdrawn before acting on the claim.
+        _stale_raw = meta.get("stale_backing")
+        _stale = [
+            e.get("ref") for e in (_stale_raw if isinstance(_stale_raw, list) else [])
+            if isinstance(e, dict) and e.get("ref")
+        ]
+        if _stale:
+            _link_bits.append("⚠ stale backing: " + ", ".join(_stale))
         links_label = " [" + " | ".join(_link_bits) + "]" if _link_bits else ""
 
         # pick body — snippet (default) or capped content (full=True).
@@ -1314,6 +1326,97 @@ def _all_tools() -> list[types.Tool]:
             ),
         ),
         types.Tool(
+            name="palinode_restore",
+            description=(
+                "Bring one archived memory back into default recall — the inverse "
+                "of `palinode_archive` for every archive path (on-demand, forget "
+                "request, TTL expiry, consolidation). Flips `status` back to "
+                "`active`, drops `superseded_by`, records `restored_at` / "
+                "`restored_from` provenance and a history line, and commits. Does "
+                "not un-strike retraction markers (use `palinode_unretract`) or "
+                "re-enable triggers."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Archived memory file path (e.g., 'insights/retired-finding.md')",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this memory is being restored (kept in the audit trail).",
+                    },
+                },
+                "required": ["file_path"],
+            },
+            annotations=types.ToolAnnotations(
+                title="Restore Archived Memory",
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+            ),
+        ),
+        types.Tool(
+            name="palinode_unretract",
+            description=(
+                "Withdraw one preference's mention-level retraction from one memory: "
+                "un-strikes every `~~…~~ [RETRACTED …]` span the pref produced and "
+                "removes the pref from the file's `retracted_prefs` record, so a "
+                "later forget request for the same pref can strike again. Pass the "
+                "pref phrase as recorded in the file's history sibling. The file's "
+                "`status` is never changed."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Memory file path carrying the retraction (e.g., 'projects/closeout.md')",
+                    },
+                    "pref": {
+                        "type": "string",
+                        "description": "The retracted preference phrase, as recorded in the history entry.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the retraction is being withdrawn (kept in the audit trail).",
+                    },
+                },
+                "required": ["file_path", "pref"],
+            },
+            annotations=types.ToolAnnotations(
+                title="Unretract Mentions",
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+            ),
+        ),
+        types.Tool(
+            name="palinode_forget_withdraw",
+            description=(
+                "Take a forget request back. Given the memory that holds the "
+                "request ('please forget that I…'), restores every memory it "
+                "archived, un-strikes every mention it retracted, and archives the "
+                "request record(s) so they stop acting as the retraction. Each step "
+                "is its own audited commit; failures are reported per target."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path of the memory holding the forget request (e.g., 'insights/forget-sneakers.md')",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the request is being withdrawn (kept in the audit trail).",
+                    },
+                },
+                "required": ["file_path"],
+            },
+            annotations=types.ToolAnnotations(
+                title="Withdraw Forget Request",
+                readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+            ),
+        ),
+        types.Tool(
             name="palinode_diff",
             description=(
                 "Show what memories changed recently. Use to review what was learned, "
@@ -1471,6 +1574,20 @@ def _all_tools() -> list[types.Tool]:
                         "description": (
                             "For 'create': Hours to wait between consecutive "
                             "firings of the same trigger.  Default 24."
+                        ),
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": (
+                            "For 'create': ISO-8601 timestamp after which the trigger "
+                            "no longer fires (it stays listed, disabled). Omit for no expiry."
+                        ),
+                    },
+                    "authority": {
+                        "type": "string",
+                        "description": (
+                            "For 'create': who or what licensed this trigger to act — "
+                            "a user grant, a session id, a policy name. Stored and shown, not enforced."
                         ),
                     },
                 },
@@ -2132,6 +2249,91 @@ async def _tool_archive(arguments: dict[str, Any]) -> list[types.TextContent]:
     )
 
 
+# ── restore (inverse of archive) ───────────────────────────────────
+@_handles("palinode_restore")
+async def _tool_restore(arguments: dict[str, Any]) -> list[types.TextContent]:
+    file_path = arguments["file_path"]
+    body = {"file_path": file_path}
+    if arguments.get("reason"):
+        body["reason"] = arguments["reason"]
+    resp = await _post("/restore", json=body)
+    if resp.status_code != 200:
+        return _text(f"Restore failed: {resp.text}")
+    data = resp.json()
+    if data.get("status") == "not_archived":
+        return _text(f"{data.get('file')} is not archived — no change.")
+    lines = [
+        f"Restored: {data.get('file')} (was {data.get('restored_from')})",
+        f"History: {data.get('history_file')}",
+        f"Chunks returned to recall: {data.get('chunks_updated', 0)}",
+    ]
+    if data.get("stale_backing"):
+        lines.append(
+            "Stale backing flagged (source no longer active): "
+            + ", ".join(data["stale_backing"])
+        )
+    if data.get("expires_at"):
+        lines.append(
+            f"Note: expires_at is still {data['expires_at']} — the TTL sweep "
+            "will re-archive it unless the expiry is changed."
+        )
+    return _text("\n".join(lines))
+
+
+# ── unretract (inverse of mention-level retraction) ────────────────
+@_handles("palinode_unretract")
+async def _tool_unretract(arguments: dict[str, Any]) -> list[types.TextContent]:
+    file_path = arguments["file_path"]
+    pref = arguments["pref"]
+    body = {"file_path": file_path, "pref": pref}
+    if arguments.get("reason"):
+        body["reason"] = arguments["reason"]
+    resp = await _post("/unretract", json=body)
+    if resp.status_code != 200:
+        return _text(f"Unretract failed: {resp.text}")
+    data = resp.json()
+    if data.get("status") == "not_retracted":
+        return _text(
+            f"{data.get('file')} carries no retraction for that pref — no change."
+        )
+    lines = [
+        f"Unretracted {data.get('mentions', 0)} mention(s) in {data.get('file')}",
+        f"History: {data.get('history_file')}",
+    ]
+    if data.get("index_error"):
+        lines.append(f"Warning: re-index failed — {data['index_error']}")
+    return _text("\n".join(lines))
+
+
+# ── forget-withdraw (take a forget request back) ───────────────────
+@_handles("palinode_forget_withdraw")
+async def _tool_forget_withdraw(arguments: dict[str, Any]) -> list[types.TextContent]:
+    file_path = arguments["file_path"]
+    body = {"file_path": file_path}
+    if arguments.get("reason"):
+        body["reason"] = arguments["reason"]
+    resp = await _post("/forget-withdraw", json=body, timeout=120.0)
+    if resp.status_code != 200:
+        return _text(f"Forget-withdraw failed: {resp.text}")
+    data = resp.json()
+    lines = [
+        f"Withdrawn: {data.get('file')} (pref: {data.get('pref')!r})",
+        f"Restored: {len(data.get('restored', []))} — "
+        + (", ".join(data.get("restored", [])) or "none"),
+        f"Unretracted: {len(data.get('unretracted', []))} — "
+        + (", ".join(u['path'] for u in data.get("unretracted", [])) or "none"),
+        "Request records archived: "
+        + (", ".join(data.get("requests_archived", [])) or "none"),
+    ]
+    if data.get("failed"):
+        lines.append(
+            "Failed: " + ", ".join(
+                f"{f['path']} ({f['op']})" for f in data["failed"]
+            )
+        )
+    return _text("\n".join(lines))
+
+
 # ── status ────────────────────────────────────────────────────────
 @_handles("palinode_status")
 async def _tool_status(arguments: dict[str, Any]) -> list[types.TextContent]:
@@ -2296,6 +2498,10 @@ async def _tool_trigger(arguments: dict[str, Any]) -> list[types.TextContent]:
             body["threshold"] = arguments["threshold"]
         if arguments.get("cooldown_hours") is not None:
             body["cooldown_hours"] = arguments["cooldown_hours"]
+        if arguments.get("expires_at"):
+            body["expires_at"] = arguments["expires_at"]
+        if arguments.get("authority"):
+            body["authority"] = arguments["authority"]
         resp = await _post("/triggers", json=body)
         if resp.status_code != 200:
             return _text(f"Error: {resp.text}")

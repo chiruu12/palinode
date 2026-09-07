@@ -22,6 +22,7 @@ from typing import Any, Collection, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from palinode.core.config import config
 from palinode.core import aliases
+from palinode.core import expiry as _expiry
 from palinode.core import parser as _parser
 # The hybrid-search scoring pipeline + its pure decay/predicate helpers live in
 # ranker.py. Re-exported here so `store.effective_importance`,
@@ -410,9 +411,19 @@ def init_db() -> None:
             last_fired TEXT,
             fire_count INT DEFAULT 0,
             created_at TEXT,
-            enabled INT DEFAULT 1
+            enabled INT DEFAULT 1,
+            expires_at TEXT,
+            authority TEXT
         )
     """)
+    # Acting-state expiry + authority (see palinode.core.expiry). NULL on
+    # pre-upgrade rows: a trigger without expires_at never expires, exactly
+    # as before; authority is display-only.
+    for _col in ("expires_at TEXT", "authority TEXT"):
+        try:
+            db.execute(f"ALTER TABLE triggers ADD COLUMN {_col}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     db.execute(f"""
         CREATE VIRTUAL TABLE IF NOT EXISTS triggers_vec USING vec0(
             id TEXT PRIMARY KEY,
@@ -1600,6 +1611,44 @@ repair path).
         db.close()
 
 
+def _mark_vectorless(fts_results: list[dict[str, Any]]) -> None:
+    """Annotate BM25 candidates in place with ``has_vector``.
+
+    A chunk written FTS-only — the per-input embed-rejection path, or a deferred
+    embed — has no ``chunks_vec`` row, so the vector arm can never carry it
+    and normalized BM25 (``raw / 25.0``, rarely above 0.35 even for an exact
+    identifier hit) is the only score it will ever have. Under the shared
+    per-arm floor that made it unreachable at the default threshold while
+    the recovery text promised it "stays keyword-searchable".
+    :func:`palinode.core.ranker.rank_hybrid` exempts ``has_vector is False``
+    candidates from the floor; everything with a vector keeps today's floor
+    (the BM25-arm measurement that deferred renormalising it holds for
+    those). Point lookups against vec0 — the same presence check
+    ``reconcile._vec_present`` uses to plan REEMBED, so the exemption retires
+    on its own once the vector is backfilled.
+
+    On a lookup failure the candidate is left as ``has_vector=True``, i.e.
+    thresholded exactly as before this fix, and the failure is logged.
+    """
+    db = get_db()
+    try:
+        for r in fts_results:
+            try:
+                row = db.execute(
+                    "SELECT 1 FROM chunks_vec WHERE id = ?", (r.get("id"),)
+                ).fetchone()
+            except Exception as exc:
+                _store_logger.warning(
+                    "vector presence check failed; thresholding as vectored "
+                    "op=search chunk_id=%s error=%r", r.get("id"), str(exc),
+                )
+                r["has_vector"] = True
+                continue
+            r["has_vector"] = row is not None
+    finally:
+        db.close()
+
+
 def search_hybrid(
     query_text: str,
     query_embedding: list[float],
@@ -1630,6 +1679,8 @@ def search_hybrid(
         threshold: Minimum PER-ARM relevance floor — real cosine similarity for
             vector candidates, normalized BM25 for FTS candidates — applied
             BEFORE RRF fusion (see :func:`palinode.core.ranker.rank_hybrid`).
+            FTS candidates with no ``chunks_vec`` row (written FTS-only) are
+            exempt: the keyword arm is the only arm they have.
             NOT a cutoff on the fused score: a production measurement found
             the post-RRF score to be a function of rank, not relevance, so
             thresholding it there selects a near-invariant rank cutoff
@@ -1687,6 +1738,8 @@ def search_hybrid(
                 logging.getLogger("palinode.store").warning(
                     "BM25 arm dropped, returning vector-only results: %s", exc)
                 fts_results = []
+        if fts_results:
+            _mark_vectorless(fts_results)
     else:
         # No BM25 arm at all — force vec_weight = 1.0 (see docstring).
         effective_hybrid_weight = 0.0
@@ -1938,9 +1991,11 @@ def add_trigger(
     embedding: list[float],
     threshold: float = 0.75,
     cooldown_hours: int = 24,
+    expires_at: str | None = None,
+    authority: str | None = None,
 ) -> None:
     """Register a prospective trigger.
-    
+
     Args:
         trigger_id: Unique ID for this trigger.
         description: What context should fire this (e.g., "LoRA training").
@@ -1948,13 +2003,16 @@ def add_trigger(
         embedding: Pre-computed embedding of the description.
         threshold: Cosine similarity threshold to fire (0.0-1.0).
         cooldown_hours: Hours between refires.
+        expires_at: ISO-8601 timestamp after which the trigger no longer
+            fires (``None`` = never expires). See ``palinode.core.expiry``.
+        authority: Free text naming who/what licensed this trigger to act.
     """
     db = get_db()
     now = _utc_now().isoformat().replace("+00:00", "Z")
     db.execute("""
-        INSERT OR REPLACE INTO triggers (id, description, memory_file, threshold, cooldown_hours, created_at, enabled, fire_count)
-        VALUES (?, ?, ?, ?, ?, ?, 1, 0)
-    """, (trigger_id, description, memory_file, threshold, cooldown_hours, now))
+        INSERT OR REPLACE INTO triggers (id, description, memory_file, threshold, cooldown_hours, created_at, enabled, fire_count, expires_at, authority)
+        VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+    """, (trigger_id, description, memory_file, threshold, cooldown_hours, now, expires_at, authority))
     
     # ADR-002: vec0 does not reliably honor `INSERT OR REPLACE` (can raise a
     # UNIQUE constraint error on an existing primary key instead of replacing
@@ -2001,16 +2059,28 @@ def check_triggers(
     for row in rows:
         if not row["enabled"]:
             continue
-            
+        # Authority monotonicity: an expired trigger no longer acts, even if
+        # the TTL sweep has not yet disabled it. Reported once per process,
+        # not once per prompt (see palinode.core.expiry).
+        if _expiry.is_past(row["expires_at"], now):
+            _expiry.report_expired_once("trigger", row["id"], row["expires_at"])
+            continue
+
         dist = row["distance"] or 0
         score = 1.0 - ((dist ** 2) / 2.0)
         
         if score >= row["threshold"]:
             if not cooldown_bypass and row["last_fired"]:
-                last_fired_date = datetime.fromisoformat(row["last_fired"][:19])
-                hours_since = (now - last_fired_date).total_seconds() / 3600
-                if hours_since < row["cooldown_hours"]:
-                    continue  # In cooldown
+                # ``now`` is aware, so ``last_fired`` must be too — the same
+                # parse as ``expires_at``: ``Z`` or offset as written by
+                # ``update_trigger_fired``, a legacy naive string as UTC.
+                # An unparseable value cannot gate; the trigger fires and
+                # the firing rewrites the column in the current format.
+                last_fired_date = _expiry.parse_expires_at(row["last_fired"])
+                if last_fired_date is not None:
+                    hours_since = (now - last_fired_date).total_seconds() / 3600
+                    if hours_since < row["cooldown_hours"]:
+                        continue  # In cooldown
             
             results.append({
                 "id": row["id"],
@@ -2028,9 +2098,30 @@ def check_triggers(
 def list_triggers() -> list[dict]:
     """Return all registered triggers with their stats."""
     db = get_db()
-    rows = db.execute("SELECT id, description, memory_file, threshold, cooldown_hours, last_fired, fire_count, created_at, enabled FROM triggers ORDER BY created_at DESC").fetchall()
+    rows = db.execute("SELECT id, description, memory_file, threshold, cooldown_hours, last_fired, fire_count, created_at, enabled, expires_at, authority FROM triggers ORDER BY created_at DESC").fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+def expire_triggers(now: datetime | None = None, dry_run: bool = False) -> list[str]:
+    """Disable every enabled trigger whose ``expires_at`` has passed.
+
+    The trigger half of the ADR-015 §2.3 TTL sweep (``archive_expired``): one
+    clock for both acting state types. ``check_triggers`` refuses an expired
+    trigger on its own, so this is bookkeeping — it makes the lapse visible
+    in ``palinode trigger list`` (``enabled: 0``) rather than only in the
+    log. Returns the ids affected; ``dry_run`` reports without writing.
+    """
+    now = now or _utc_now()
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, expires_at FROM triggers WHERE enabled = 1 AND expires_at IS NOT NULL"
+    ).fetchall()
+    expired = [r["id"] for r in rows if _expiry.is_past(r["expires_at"], now)]
+    if expired and not dry_run:
+        db.executemany("UPDATE triggers SET enabled = 0 WHERE id = ?", [(i,) for i in expired])
+        db.commit()
+    db.close()
+    return expired
 
 def delete_trigger(trigger_id: str) -> None:
     """Remove a trigger."""

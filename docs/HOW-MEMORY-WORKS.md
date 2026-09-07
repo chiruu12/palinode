@@ -51,7 +51,9 @@ graph TD
 
 **Hook:** `before_agent_start` in the OpenClaw plugin
 
-Every time you send a message, Palinode injects relevant context **before the agent sees your message**. This happens in four phases:
+Every time you send a message, Palinode injects relevant context **before the agent sees your message**. This happens in four phases.
+
+To see the session-start digest yourself — the same one the SessionStart hook warms and the MCP `session_init` tool returns — run `palinode prime` from the project directory (see [CLI.md](CLI.md#palinode-prime)).
 
 ### Phase 1: Core Memory (always injected)
 
@@ -75,6 +77,8 @@ Core memory persists in the model's context window from turn 1 until OpenClaw co
 - `projects/my-app.md` — current project status
 - `projects/palinode.md` — memory system status
 - `projects/infrastructure.md` — infrastructure notes and service status
+
+**Core memory can expire.** A `core: true` memory is *acting* state — it is injected without anyone asking — so it may carry the same `expires_at` (ISO-8601) that ephemeral memories use for the TTL sweep, plus an optional free-text `authority` naming who or what licensed it to act (`"paul: standing"`, a session id, a policy name). Set both through `metadata` at save time (`metadata: {expires_at: ..., authority: ...}`, or `metadata.ttl` for a duration). Past its `expires_at` a core memory stays on disk, in git, and searchable — it just stops being injected: `GET /list?core_only=true` (the session-start hook and the harness plugins) and `/context/prime` (`palinode_session_init`, `palinode prime`) both withhold it, and the lapse is logged once. `authority` is stored and displayed, not enforced. `palinode lint` lists core memories with no `expires_at`.
 
 ### Phase 2: Topic-Specific Search (per message)
 
@@ -109,6 +113,8 @@ If your message discusses known entities (people, projects), Palinode searches t
 ### Phase 4: Prospective Triggers
 
 Palinode maintains a background index of "triggers" (specific situational contexts). Every message is checked against this list. If the semantic meaning of your message matches a trigger description, the associated memory file is forcibly injected into the context. This allows the agent to essentially leave a "note to self" to remember a specific file the next time a specific situation arises.
+
+A trigger acts under whatever authority existed when it was written, so it can carry an expiry: `palinode_trigger create` (MCP), `palinode trigger add --expires-at ... --authority ...` (CLI) and `POST /triggers` all accept `expires_at` (ISO-8601) and a free-text `authority`. An expired trigger is skipped at check time and logged once — not once per prompt — and the `archive-expired` sweep that ages out ephemeral memories also flips it to `enabled: 0`, so `palinode trigger list` shows the lapse. A trigger without `expires_at` never expires, exactly as before.
 
 **What the agent sees (wrapped in `<palinode-memory>` tags):**
 
@@ -342,6 +348,8 @@ The entity index is a reverse lookup: given an entity, find all files that menti
 **API:** `GET /entities/person/alice` → returns all files referencing Alice
 
 **Entity graph:** shows which entities co-occur. If `person/alice` and `project/checkout` always appear together, the system knows they're related.
+
+**CLI:** `palinode entities` lists every tracked entity; `palinode entities person/alice` returns the files that reference it (see [CLI.md](CLI.md#palinode-entities)).
 
 **Currently 20 entities tracked** across 219 files.
 

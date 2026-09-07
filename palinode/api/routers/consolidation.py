@@ -100,6 +100,96 @@ def archive_api(req: ArchiveRequest) -> dict[str, Any]:
         raise _safe_500(e, "Archive failed")
 
 
+class RestoreRequest(BaseModel):
+    file_path: str
+    reason: str | None = None
+
+
+@router.post("/restore")
+def restore_api(req: RestoreRequest) -> dict[str, Any]:
+    """Bring one archived memory back into default recall — the inverse of
+    `/archive` for every archive path (on-demand, forget-driven, TTL,
+    consolidation).
+
+    Flips `status` back to `active`, drops `superseded_by`, records
+    `restored_at` / `restored_from` provenance, appends a history line,
+    propagates the status to the chunk index, and commits both files.
+    Retraction markers and triggers are not resurrected. Idempotent: a memory
+    that is not archived is reported unchanged.
+    """
+    from palinode.consolidation.archive import restore_memory
+
+    try:
+        return restore_memory(req.file_path, reason=req.reason)
+    except PathTraversalError as e:
+        status_code = 400 if e.malformed else 403
+        raise HTTPException(status_code=status_code, detail="Invalid path")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except Exception as e:
+        raise _safe_500(e, "Restore failed")
+
+
+class UnretractRequest(BaseModel):
+    file_path: str
+    pref: str
+    reason: str | None = None
+
+
+@router.post("/unretract")
+def unretract_api(req: UnretractRequest) -> dict[str, Any]:
+    """Withdraw one pref's mention-level retraction from one memory.
+
+    Un-strikes every span carrying the pref's retraction marker, removes the
+    pref from the file's `retracted_prefs` record, appends a history line,
+    commits, and re-indexes. The file's `status` is never changed. Idempotent:
+    a pref not in the record is reported unchanged.
+    """
+    from palinode.consolidation.retract import unretract_mentions
+
+    try:
+        return unretract_mentions(req.file_path, req.pref, reason=req.reason)
+    except PathTraversalError as e:
+        status_code = 400 if e.malformed else 403
+        raise HTTPException(status_code=status_code, detail="Invalid path")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except Exception as e:
+        raise _safe_500(e, "Unretract failed")
+
+
+class ForgetWithdrawRequest(BaseModel):
+    file_path: str
+    reason: str | None = None
+
+
+@router.post("/forget-withdraw")
+def forget_withdraw_api(req: ForgetWithdrawRequest) -> dict[str, Any]:
+    """Take a forget request back: restore what it archived, un-strike what it
+    retracted, and archive the request record(s) so they stop acting as
+    tombstones. `file_path` names the forget-request memory; 409 when the
+    memory carries no forget request.
+    """
+    from palinode.consolidation.forget import (
+        NotAForgetRequest,
+        withdraw_forget_request,
+    )
+
+    try:
+        return withdraw_forget_request(req.file_path, reason=req.reason)
+    except PathTraversalError as e:
+        status_code = 400 if e.malformed else 403
+        raise HTTPException(status_code=status_code, detail="Invalid path")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    except NotAForgetRequest:
+        raise HTTPException(
+            status_code=409, detail="Memory carries no forget request"
+        )
+    except Exception as e:
+        raise _safe_500(e, "Forget-withdraw failed")
+
+
 @router.post("/split-layers")
 def split_layers_api() -> dict[str, Any]:
     """Split core files into Identity/Status/History layers."""

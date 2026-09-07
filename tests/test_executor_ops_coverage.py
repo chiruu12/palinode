@@ -26,10 +26,12 @@ Pure file-mutation layer — no DB, no Ollama.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import palinode.consolidation.executor as executor_module
 from palinode.consolidation.executor import apply_operations
 from palinode.core.config import config
 
@@ -53,6 +55,7 @@ ZERO_STATS = {
     "protected_rejected": 0,
     "contradicts_proposed": 0,
     "unmatched": 0,
+    "review_flagged": 0,
 }
 
 # The seed facts, as their plain *active* bullet lines. Asserting one of these is
@@ -210,6 +213,111 @@ def test_merge_removes_all_found_sources_and_keeps_unrelated_facts(memory_file: 
     assert "<!-- fact:f2 -->" not in content
     assert "<!-- fact:f3 -->" not in content
     assert DUP_F1_ACTIVE in content
+
+
+# MERGE was the one retiring op with no history write (fixed). The contract
+# (docs/EXECUTOR-SPEC.md §MERGE) is that every source fact's original text —
+# ids[0]'s replaced text and each removed ids[1:] line — lands verbatim in the
+# `-history.md` sibling, tagged with the source's own id, naming the merged id
+# and the rationale. The merged line itself is exactly what it was before.
+
+MERGE_F2_F3 = {
+    "op": "MERGE",
+    "ids": ["f2", "f3"],
+    "new_text": "- [2024-01-02] Second and third, consolidated",
+    "rationale": "f2 and f3 restate one update",
+}
+
+
+def test_merge_records_every_source_fact_in_history(memory_file: Path) -> None:
+    stats = apply_operations(str(memory_file), [MERGE_F2_F3])
+
+    assert stats["merged"] == 1
+    history = _read_history(memory_file)
+    entries = [line for line in history.splitlines() if line.startswith("- [")]
+    assert len(entries) == 2
+    f2_entry, f3_entry = entries
+    # ids[0]: its text is replaced in the main file, so its pre-merge text is
+    # the record. ids[1:]: removed outright, so the line is the record.
+    assert "Second project fact" in f2_entry and f2_entry.endswith("<!-- fact:f2 -->")
+    assert "Third project fact" in f3_entry and f3_entry.endswith("<!-- fact:f3 -->")
+    for entry in entries:
+        assert "merged-f2" in entry           # where the parts went
+        assert "f2 and f3 restate one update" in entry  # why
+    # History carries the archived status so it stays out of default recall.
+    assert history.startswith("---\ncategory: history\ncore: false\nstatus: archived\n---\n")
+
+
+def test_merge_main_file_result_is_unchanged_by_history_write(memory_file: Path) -> None:
+    apply_operations(str(memory_file), [MERGE_F2_F3])
+
+    content = _read(memory_file)
+    # The merged line is exactly today's shape: prefix + normalized new_text +
+    # merged-id marker, no added annotation.
+    assert "- [2024-01-02] Second and third, consolidated <!-- fact:merged-f2 -->\n" in content
+    assert F2_ACTIVE not in content
+    assert F3_ACTIVE not in content
+    assert F1_ACTIVE in content
+    assert DUP_F1_ACTIVE in content
+
+
+def test_merge_records_each_removed_line_for_a_duplicated_source_id(memory_file: Path) -> None:
+    # f1 appears on two lines; both are removed, so both are recorded — a
+    # first-match-only record would lose the second line.
+    stats = apply_operations(
+        str(memory_file),
+        [{"op": "MERGE", "ids": ["f2", "f1"], "new_text": "- [2024-01-02] Merged", "reason": "dup"}],
+    )
+
+    assert stats["merged"] == 1
+    content = _read(memory_file)
+    assert F1_ACTIVE not in content
+    assert DUP_F1_ACTIVE not in content
+    history = _read_history(memory_file)
+    assert "Second project fact" in history
+    assert "First project fact" in history
+    assert "Duplicate first fact text" in history
+    assert history.count("<!-- fact:f1 -->") == 2
+    assert "(reason: dup)" in history  # `reason` is honoured when `rationale` is absent
+
+
+def test_merge_rejected_by_nightly_policy_writes_no_history(memory_file: Path) -> None:
+    # f2 and f3 carry different dates, so the nightly guard refuses the merge
+    # before the helper runs — nothing is retired, so nothing is recorded.
+    before = _read(memory_file)
+    stats = apply_operations(str(memory_file), [MERGE_F2_F3], nightly_policy=True)
+
+    assert stats["merge_rejected"] == 1
+    assert stats["merged"] == 0
+    assert _read(memory_file) == before
+    assert not _history_path(memory_file).exists()
+
+
+def test_merge_output_is_deterministic_across_runs(tmp_path: Path, monkeypatch) -> None:
+    # Same starting file, same ops, same clock → byte-identical main file and
+    # history sibling. The clock is the only non-deterministic input, so it is
+    # pinned; everything else the executor emits must follow from the inputs.
+    frozen = datetime(2026, 9, 5, 12, 34, tzinfo=UTC)
+    monkeypatch.setattr(executor_module, "_utc_now", lambda: frozen)
+    ops = [MERGE_F2_F3, {"op": "KEEP", "id": "f1"}]
+    body = """- [2024-01-01] First project fact <!-- fact:f1 -->
+- [2024-01-02] Second project fact <!-- fact:f2 -->
+- [2024-01-03] Third project fact <!-- fact:f3 -->
+"""
+
+    outputs = []
+    for run in ("a", "b"):
+        run_dir = tmp_path / run
+        run_dir.mkdir()
+        target = _write_memory(run_dir, body)
+        stats = apply_operations(str(target), ops)
+        assert stats["merged"] == 1
+        outputs.append((_read(target), _read_history(target)))
+
+    assert outputs[0] == outputs[1]
+    _, history = outputs[0]
+    assert "- [2026-09-05 12:34] Merged into merged-f2 (2026-09-05): [2024-01-02] Second project fact (reason: f2 and f3 restate one update) <!-- fact:f2 -->\n" in history
+    assert "- [2026-09-05 12:34] Merged into merged-f2 (2026-09-05): [2024-01-03] Third project fact (reason: f2 and f3 restate one update) <!-- fact:f3 -->\n" in history
 
 
 # ── SUPERSEDE ────────────────────────────────────────────────────────────────

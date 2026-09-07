@@ -1247,8 +1247,8 @@ visually while your AI agents read and write through the CLI or MCP server.
 - Wikilinks (`[[like this]]`) are first-class — Palinode reads and writes them.
 - Do not edit files under `.palinode/` — that directory is managed by the daemon.
 - The graph view collapses `archive/`, `logs/`, and `.palinode/` by default.
-- Re-run `palinode init --obsidian <vault-path>` to restore scaffolded files
-  if they are accidentally deleted (user-edited files are preserved).
+- Re-run `palinode init --obsidian --dir <vault-path>` to restore scaffolded
+  files if they are accidentally deleted (user-edited files are preserved).
 """
 
 

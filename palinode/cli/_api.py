@@ -356,6 +356,32 @@ fields, the session-end hook audit push)."""
         response.raise_for_status()
         return response.json()
 
+    def restore(self, file_path: str, reason: str | None = None):
+        payload: dict = {"file_path": file_path}
+        if reason is not None:
+            payload["reason"] = reason
+        response = self.client.post("/restore", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def unretract(self, file_path: str, pref: str, reason: str | None = None):
+        payload: dict = {"file_path": file_path, "pref": pref}
+        if reason is not None:
+            payload["reason"] = reason
+        response = self.client.post("/unretract", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def forget_withdraw(self, file_path: str, reason: str | None = None):
+        payload: dict = {"file_path": file_path}
+        if reason is not None:
+            payload["reason"] = reason
+        response = self.client.post(
+            "/forget-withdraw", json=payload, timeout=120.0
+        )
+        response.raise_for_status()
+        return response.json()
+
     def archive_expired(self, dry_run: bool = False) -> dict[str, Any]:
         response = self.client.post("/archive-expired", json={"dry_run": dry_run})
         response.raise_for_status()
@@ -368,6 +394,8 @@ fields, the session-end hook audit push)."""
         threshold: float | None = None,
         cooldown_hours: int | None = None,
         trigger_id: str | None = None,
+        expires_at: str | None = None,
+        authority: str | None = None,
     ) -> dict[str, Any]:
         # ADR-010: forward all four canonical params. Defaults live
         # in palinode.core.defaults so the CLI can show them in --help.  We
@@ -383,6 +411,10 @@ fields, the session-end hook audit push)."""
             payload["cooldown_hours"] = cooldown_hours
         if trigger_id is not None:
             payload["trigger_id"] = trigger_id
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
+        if authority is not None:
+            payload["authority"] = authority
         response = self.client.post("/triggers", json=payload)
         response.raise_for_status()
         return response.json()

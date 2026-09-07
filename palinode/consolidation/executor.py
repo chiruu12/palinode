@@ -169,7 +169,14 @@ def apply_operations(file_path: str, operations: list[dict], *, nightly_policy: 
     # consolidation entirely.
     is_replace_doc = _is_replace_policy(content)
 
-    stats = {"kept": 0, "updated": 0, "merged": 0, "superseded": 0, "archived": 0, "retracted": 0, "merge_rejected": 0, "protected_rejected": 0, "contradicts_proposed": 0, "unmatched": 0}
+    stats = {"kept": 0, "updated": 0, "merged": 0, "superseded": 0, "archived": 0, "retracted": 0, "merge_rejected": 0, "protected_rejected": 0, "contradicts_proposed": 0, "unmatched": 0, "review_flagged": 0}
+
+    # Every op that retires a fact's current text — SUPERSEDE, ARCHIVE, RETRACT,
+    # MERGE — is recorded here as (kind, fact ids, reason) so that, once the
+    # file is written, the memories whose `backed_by` cites it can be flagged
+    # for review. Collected across the loop and propagated once per call: one
+    # scan of the store, one commit, whatever the number of ops.
+    retirements: list[tuple[str, list[str], str]] = []
 
     for op in operations:
         if not isinstance(op, dict):
@@ -225,6 +232,7 @@ def apply_operations(file_path: str, operations: list[dict], *, nightly_policy: 
         elif op_type == "MERGE":
             ids = op.get("ids", [])
             new_text = op.get("new_text", "")
+            reason = op.get("rationale", op.get("reason", ""))
             if ids and new_text:
                 if nightly_policy and not _nightly_merge_allowed(body, ids):
                     id_list = ", ".join(ids)
@@ -234,10 +242,11 @@ def apply_operations(file_path: str, operations: list[dict], *, nightly_policy: 
                     )
                     stats["merge_rejected"] += 1
                     continue
-                merged_body = _merge_facts(body, ids, new_text)
+                merged_body = _merge_facts(body, ids, new_text, reason, file_path)
                 if merged_body != body:
                     body = merged_body
                     stats["merged"] += 1
+                    retirements.append(("merge", list(ids), reason))
                 else:
                     logger.warning(
                         "MERGE unmatched: fact id(s)=%r not found in %s",
@@ -261,6 +270,7 @@ def apply_operations(file_path: str, operations: list[dict], *, nightly_policy: 
                 if superseded_body != body:
                     body = superseded_body
                     stats["superseded"] += 1
+                    retirements.append(("supersede", [fact_id], reason))
                 else:
                     logger.warning(
                         "SUPERSEDE unmatched: fact id=%r not found in %s",
@@ -283,6 +293,7 @@ def apply_operations(file_path: str, operations: list[dict], *, nightly_policy: 
                 if archived_body != body:
                     body = archived_body
                     stats["archived"] += 1
+                    retirements.append(("archive", [fact_id], reason))
                 else:
                     logger.warning(
                         "ARCHIVE unmatched: fact id=%r not found in %s",
@@ -304,6 +315,7 @@ def apply_operations(file_path: str, operations: list[dict], *, nightly_policy: 
                 if retracted_body != body:
                     body = retracted_body
                     stats["retracted"] += 1
+                    retirements.append(("retract", [fact_id], reason))
                 else:
                     logger.warning(
                         "RETRACT unmatched: fact id=%r not found in %s",
@@ -352,6 +364,26 @@ def apply_operations(file_path: str, operations: list[dict], *, nightly_policy: 
     # Write back
     _atomic_write_text(file_path, frontmatter_block + body)
 
+    # `backed_by` propagation (one hop, flag-only): now that the retirements
+    # are on disk, every live memory citing this file as a source gets a
+    # `stale_backing` entry. Deterministic, idempotent per source, its own
+    # commit. The dependents are not rewritten — that is the next
+    # consolidation pass's job, with the flag as its input.
+    if retirements:
+        from palinode.consolidation.propagate import flag_dependents
+
+        reasons: list[str] = []
+        for _, _, r in retirements:
+            if r and r not in reasons:
+                reasons.append(r)
+        flagged = flag_dependents(
+            file_path,
+            ops=[kind for kind, _, _ in retirements],
+            facts=[fid for _, ids, _ in retirements for fid in ids],
+            reason="; ".join(reasons),
+        )
+        stats["review_flagged"] = len(flagged)
+
     return stats
 
 
@@ -365,15 +397,42 @@ def _update_fact(content: str, fact_id: str, new_text: str) -> str:
     return pattern.sub(replacement, content, count=1)
 
 
-def _merge_facts(content: str, ids: list[str], new_text: str) -> str:
-    """Remove all source facts and insert merged fact at first occurrence."""
+def _merge_facts(content: str, ids: list[str], new_text: str,
+                 reason: str, file_path: str) -> str:
+    """Remove all source facts and insert merged fact at first occurrence.
+
+    Every source fact's original text — ``ids[0]``, whose text is replaced,
+    and ``ids[1:]``, whose lines are removed — is appended verbatim to the
+    ``-history.md`` sibling before the body is mutated. MERGE was the
+    one op whose sources leave the main file entirely, so without this the
+    only copy of the working behind a merged conclusion was in ``git log``,
+    which recall cannot address.
+    """
     first_id = ids[0]
     merged_id = f"merged-{ids[0]}"
-    
+    now = _utc_now().strftime("%Y-%m-%d")
+
+    def fact_pattern(fid: str) -> re.Pattern[str]:
+        return re.compile(
+            r'^([\s]*[-*]\s+)(.*?)(<!-- fact:' + re.escape(fid) + r' -->)\n?',
+            re.MULTILINE,
+        )
+
+    def record(fid: str, old_text: str) -> None:
+        append_to_history(
+            file_path, fid,
+            f"Merged into {merged_id} ({now}): {old_text} (reason: {reason})",
+        )
+
+    first_match = fact_pattern(first_id).search(content)
+    if first_match is None:
+        return content
+
     # Replace first with merged text
     updated_content = _update_fact(content, first_id, new_text)
     if updated_content == content:
         return content
+    record(first_id, first_match.group(2).strip())
     content = updated_content
     # Update the fact ID to the merged ID
     content = re.sub(
@@ -382,15 +441,15 @@ def _merge_facts(content: str, ids: list[str], new_text: str) -> str:
         content,
         count=1,
     )
-    
-    # Remove remaining source facts
+
+    # Remove remaining source facts. Every removed line is recorded, not just
+    # the first match — a duplicate id is still a fact leaving the file.
     for fid in ids[1:]:
-        pattern = re.compile(
-            r'^[\s]*[-*]\s+.*?<!-- fact:' + re.escape(fid) + r' -->\n?',
-            re.MULTILINE
-        )
+        pattern = fact_pattern(fid)
+        for m in pattern.finditer(content):
+            record(fid, m.group(2).strip())
         content = pattern.sub('', content)
-    
+
     return content
 
 

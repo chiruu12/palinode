@@ -393,6 +393,7 @@ def run_lint_pass() -> dict[str, Any]:
     missing_entities: list[str] = []
     missing_descriptions: list[str] = []
     missing_priority: list[str] = []
+    missing_expiry: list[str] = []
     wiki_drift: list[dict[str, Any]] = []
     relative_dates: list[dict[str, Any]] = []
     source_anchor_issues: list[dict[str, Any]] = []
@@ -402,6 +403,10 @@ def run_lint_pass() -> dict[str, Any]:
     # or supersession. Reuses the stale threshold (90 days).
     stale_open_questions: list[dict[str, Any]] = []
     open_contradictions: list[dict[str, Any]] = []  # (G4)
+    # A `backed_by` source that was superseded / retracted / archived / merged
+    # away leaves a `stale_backing` entry on each dependent; the memory is
+    # still live but its support was withdrawn, so it wants a second look.
+    stale_backing: list[dict[str, Any]] = []
     core_count = 0
 
     now = datetime.now(timezone.utc)
@@ -496,6 +501,11 @@ def run_lint_pass() -> dict[str, Any]:
         # 5. Core count
         if meta.get("core"):
             core_count += 1
+            # Acting state should carry an expiry (palinode.core.expiry): a
+            # core memory with no `expires_at` acts under its original grant
+            # forever. Advisory — nothing is disabled here.
+            if not meta.get("expires_at"):
+                missing_expiry.append(path)
 
         # 6. Missing human priority on core and decision memories.
         if (meta.get("core") is True or meta.get("type") == "Decision") and "priority" not in meta:
@@ -621,6 +631,15 @@ def run_lint_pass() -> dict[str, Any]:
         if _contradicts:
             open_contradictions.append({"file": path, "contradicts": _contradicts})
 
+        # 10. Stale backing — the dependent side of `backed_by` propagation.
+        # Reported until the memory is re-saved (which rebuilds its frontmatter
+        # and so clears the flag). Archived dependents assert nothing in recall
+        # and are not reported.
+        from palinode.consolidation.propagate import parse_stale_backing
+        _stale = parse_stale_backing(meta)
+        if _stale and meta.get("status") != "archived":
+            stale_backing.append({"file": path, "stale_backing": _stale})
+
     # 4. Contradictions heuristics
     # Simple check: Any entity that has multiple active files
     file_statuses = {}
@@ -662,12 +681,14 @@ def run_lint_pass() -> dict[str, Any]:
         "missing_entities": missing_entities,
         "missing_descriptions": missing_descriptions,
         "missing_priority": missing_priority,
+        "missing_expiry": missing_expiry,
         "wiki_drift": wiki_drift,
         "relative_dates": relative_dates,
         "source_anchor_issues": source_anchor_issues,
         "claim_anchor_issues": claim_anchor_issues,
         "stale_open_questions": stale_open_questions,
         "open_contradictions": open_contradictions,
+        "stale_backing": stale_backing,
         # Refs that look like aliases of one another. Detection only — the
         # report is a question for a human, never an instruction to merge.
         "entity_aliases": check_entity_aliases(entity_references),

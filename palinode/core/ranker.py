@@ -136,8 +136,13 @@ def rank_hybrid(
 
     ``threshold`` filters ``vec_results`` by their own (real cosine) score and
     ``fts_results`` by their own (normalized BM25) score, BEFORE fusion — a
-    candidate needs only one arm to clear the bar to be considered at all. It
-    is deliberately **not** applied to the fused/boosted score: a production
+    candidate needs only one arm to clear the bar to be considered at all.
+    The one exemption: an FTS candidate carrying ``has_vector=False`` (the
+    store's mark for a chunk with no ``chunks_vec`` row) is kept regardless
+    of its BM25 score, because the keyword arm is the only arm it has (the
+    FTS-only reachability fix); it then enters fusion as an ordinary FTS
+    candidate. ``threshold`` is deliberately **not** applied to the
+    fused/boosted score: a production
     measurement found that score to be a function of RRF rank, not
     relevance — two semantically unrelated queries against the same store
     produced byte-identical post-RRF sequences (``1.0, 0.4919, 0.4841,
@@ -159,7 +164,15 @@ def rank_hybrid(
             r for r in vec_results
             if (r.get("raw_score") if r.get("raw_score") is not None else r.get("score", 0.0)) >= threshold
         ]
-        fts_results = [r for r in fts_results if r.get("score", 0.0) >= threshold]
+        # A candidate the store marked ``has_vector=False`` (an FTS-only row:
+        # per-input embed rejection, deferred embed) is exempt from the floor —
+        # the vector arm can never vouch for it, and normalized BM25 alone
+        # rarely clears the shared threshold. Anything with a vector, or
+        # without the flag at all, is floored exactly as before.
+        fts_results = [
+            r for r in fts_results
+            if r.get("score", 0.0) >= threshold or r.get("has_vector") is False
+        ]
 
     # Reciprocal Rank Fusion (RRF)
     # Score = sum( 1 / (k + rank) ) for each result across both lists

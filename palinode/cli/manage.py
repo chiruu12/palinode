@@ -5,7 +5,7 @@ from palinode.cli._format import console, print_result, get_default_format, Outp
 @click.command()
 @click.option("--format", "fmt", type=click.Choice(["json", "text"]), help="Output format")
 def reindex(fmt):
-    """Explicitly trigger absolute database rescans sequences."""
+    """Rescan every memory file and re-embed only what changed."""
     try:
         result = api_client.reindex()
         print_result(result, fmt=OutputFormat(fmt) if fmt else get_default_format())

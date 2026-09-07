@@ -13,6 +13,7 @@ from palinode.cli.diff import diff
 from palinode.cli.consolidate import consolidate
 from palinode.cli.archive import archive
 from palinode.cli.archive_expired import archive_expired
+from palinode.cli.restore import restore, unretract, forget_withdraw
 from palinode.cli.trigger import trigger
 from palinode.cli.doctor import doctor
 from palinode.cli.manage import reindex, rebuild_fts, split_layers, bootstrap_ids
@@ -80,6 +81,9 @@ main.add_command(consolidate)
 main.add_command(consolidate, name="dream")
 main.add_command(archive)
 main.add_command(archive_expired)
+main.add_command(restore)
+main.add_command(unretract)
+main.add_command(forget_withdraw)
 main.add_command(trigger)
 main.add_command(doctor)
 

@@ -14,6 +14,178 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Security
 
+## [0.17.0] — 2026-09-07
+
+**Compatibility:** The OpenClaw plugin manifest (`plugin/openclaw.plugin.json`, plugin
+0.2.0) now declares `recallProfile` and `midTurnMode` as closed enums and rejects unknown
+keys, so a config with a misspelled profile or an unrecognised key **fails to load** with a
+named error where it previously fell back to defaults silently. Check
+`plugins.entries.<id>.config` against `plugin/INSTALL.md` before upgrading. The MCP full tool
+surface grows from 29 to 32 (`palinode_restore`, `palinode_unretract`,
+`palinode_forget_withdraw`); a client that pins the tool count needs the new number.
+
+### Added
+
+- `docs/CLI.md` — a command reference with one entry per `palinode` command: synopsis,
+  purpose, options with defaults, an example, and which output pattern the command follows
+  (TTY-aware `--format`, `--json` flag, or text only). The 18 commands no shipping doc named
+  (`prime`, `entities`, `review`, `repair-status`, `retrieval-stats`, the embedding tools,
+  `config`, `ingest`, `prompt`, and the operator-maintenance commands) are now documented, along
+  with `restore`, `unretract`, `forget-withdraw`, and `trigger add --expires-at/--authority`.
+  `tests/test_cli_reference_docs.py` keeps the page and the registered click commands in sync in
+  both directions. `HOW-MEMORY-WORKS.md` now points at `palinode prime` and `palinode entities`
+  from the sections that explain them, and `OPERATIONS.md` gains a `repair-status` recovery
+  scenario. README: the tool-to-CLI naming sentence no longer implies `doctor_deep` and
+  `session_init` are CLI commands; QUICKSTART: `init --obsidian` takes `--dir`, not a positional
+  path.
+- **`backed_by` propagation — retiring a source flags its dependents for review.**
+  `backed_by` is now an extension edge with propagation semantics:
+  when a memory that other memories cite as their source has a fact superseded,
+  archived, retracted or merged away by the consolidation executor, or is
+  archived/superseded or retracted on demand, every live dependent gains one
+  `stale_backing` frontmatter entry naming the source ref, the retirement kind,
+  the retired fact ids, the reason and a timestamp. Flag only — the dependent is
+  never rewritten, archived or retracted; it stays in recall, visibly contested.
+  Written by the deterministic path (never the LLM), one hop, idempotent per
+  source, committed with provenance as its own commit, and cleared by re-saving
+  the dependent (the save path rebuilds frontmatter from its inputs, so a re-save
+  is the re-verification). Surfaces: `lint` reports `stale_backing` on every
+  surface, the `/ui/quality` page gains a *Stale backing* queue (counted in the
+  sidebar badge), the advisory review proposes a `PROPOSE_UPDATE` per flagged
+  memory, `palinode_search` results carry `⚠ stale backing: <ref>`, and the
+  executor stats gain `review_flagged`. `contradicts` stays an association
+  edge and never propagates. New `palinode/consolidation/propagate.py`;
+  contract in `docs/EXECUTOR-SPEC.md` § Dependency propagation.
+- **Archival and retraction are reversible on every surface.** `palinode restore <file>`,
+  `POST /restore`, the `palinode_restore` MCP tool and the plugin core's `restoreMemory()` are
+  the inverse of every archive path (on-demand, forget request, TTL expiry, consolidation):
+  `status` flips back to `active`, `superseded_by` is dropped, and the frontmatter is
+  reconstructed from the archived file itself — `created_at` and every other field survive —
+  with `restored_at` / `restored_from` provenance, a `-history.md` line, and one commit. Restore
+  does not resurrect what it did not archive: retraction markers, `retracted_prefs`, and
+  triggers are separate lifecycle state. `palinode unretract <file> <pref>` / `POST /unretract` /
+  `palinode_unretract` / `unretractMentions()` is the inverse of a mention-level retraction —
+  un-strikes exactly the pref's own `[RETRACTED … r:<id>]` spans and clears its `retracted_prefs`
+  entry. `palinode forget-withdraw <request>` / `POST /forget-withdraw` /
+  `palinode_forget_withdraw` / `withdrawForgetRequest()` takes a forget request back by composing
+  the two over the request's targets and archiving the request record(s). All three are
+  registered in `palinode/core/parity.py`. **Re-trigger safety:** a forget request now resolves
+  only against memories that existed when it was first made — the boundary is the request
+  memory's own `created_at` (preserved across re-saves) or the earliest live request record for
+  the same pref, and a restored memory's `restored_at` counts as its creation — so a re-saved
+  request (a SessionEnd floor-hook re-capture, a session summary landing on the same slug twice)
+  can no longer archive a pref memory created after the original resolution. Same-pref request
+  records are never targets. The save result reports `resolved_before` and `prior_requests`.
+- `expires_at` + `authority` on the two state types that act. Triggers gain
+  both as columns (migration is additive; existing rows read back `NULL` and never
+  expire) and as `palinode_trigger create` / `trigger add --expires-at --authority` /
+  `POST /triggers` parameters; `check_triggers` skips an expired trigger and logs it
+  once per process, and the `archive-expired` sweep flips it to `enabled: 0`. A
+  `core: true` memory past its frontmatter `expires_at` is withheld from
+  `GET /list?core_only=true` and `/context/prime` — every injection surface — while
+  staying listed, readable, and searchable. `authority` is free text, stored and shown,
+  not enforced. `palinode lint` reports core memories with no `expires_at`. Gate lives
+  in `palinode/core/expiry.py`.
+- `embeddings.primary.dialect: ollama | openai` — the embed client can now speak
+  the OpenAI-compatible `/v1/embeddings` shape, so llama.cpp (`llama-server --embedding`),
+  vLLM, and LM Studio can serve as the embedding backend. Default `ollama` leaves existing
+  deployments untouched; an unknown value fails config load. The `openai` path is one POST of
+  `{model, input}` under the same EMBED-role circuit breaker, retry/backoff, and structured
+  logging as the Ollama path; responses are validated whole and re-ordered by `index`; a
+  server 400 or llama.cpp's "input is too large to process" 500 maps to the per-input
+  `EmbeddingInputError` (chunk stays FTS-only, re-embedded next pass) rather than an outage;
+  a `url` ending in `/v1` is not doubled; the Ollama-only `/api/show` preflight is skipped.
+  Documented in the README and the example config; no bearer-token support (the chat role's
+  OpenAI path has none to mirror either).
+
+### Changed
+
+- `docs/BENCHMARKS.md` → *LongMemEval-V2* gains *The BM25 arm, measured*: the store's stock
+  implicit-AND FTS path against the adapter's OR-joined arm on the same web store — 42.5 vs
+  48.3, 27 lost / 13 won, single seed. The BM25 arm carries recall on exact-label questions;
+  the earlier LongMemEval-S conclusion that the vector arm covers it does not transfer.
+  Artifacts under `bench/results/longmemeval-v2-*-ftsand-2026-09-05/`.
+- `palinode/cli/_api.py`'s 35 API-adapter methods now carry return annotations matching each
+  endpoint handler's own type — 24 `dict[str, Any]`, 7 `list[dict[str, Any]]`, 3 `dict[str, str]`,
+  and a `list[…] | dict[…]` union on `get_entities` — instead of no annotation at all
+  ([#194](https://github.com/phasespace-labs/palinode/pull/194), thanks [@Saket7002](https://github.com/Saket7002)).
+- `bench/abstention.py` now separates the two search arms: each observation records the ordered
+  result keys and how many results reached the merged set through BM25 alone, `compare_arms`
+  distinguishes a reorder from a membership change at each floor, and the Markdown report gains
+  a *BM25 arm contribution* section with the normalized BM25 candidate scores per seed. The
+  counted metrics were blind to ordering, so the vector and hybrid rows were identical wherever
+  BM25 changed rank but not membership
+  ([#197](https://github.com/phasespace-labs/palinode/pull/197), thanks [@chiruu12](https://github.com/chiruu12)).
+
+### Fixed
+
+- `restore` re-checks the restored memory's own `backed_by` sources. `backed_by`
+  propagation skips archived dependents, so a source superseded, archived or removed *while*
+  a dependent was archived left no `stale_backing` flag on it, and `restore` brought the
+  dependent back into recall citing withdrawn support with no flag, no lint finding and no
+  quality-queue entry. Restore now runs the same one-hop check against the sources' current
+  state and appends a `stale_backing` entry with `op: restore-check` (the `reason` names the
+  observed state: archived, superseded by X, or missing) for each source no longer active —
+  idempotent per source ref, in the restore's own commit, named in the history line, reported
+  as `stale_backing` in the result and on the CLI / MCP text output.
+- OpenClaw plugin: `plugin/openclaw.plugin.json` is now generated from the TypeBox config
+  schema in `plugin/index.ts` (`npm run manifest`; `plugin/test/manifest.test.ts` fails on
+  drift), so the manifest the host validates config against accepts the documented
+  `recallProfile`, `recallProfileConfig`, and `midTurnMode` keys it used to reject with
+  `invalid config`. Plugin version 0.2.0. The four Node test suites (`plugin/`,
+  `plugins/pi`, `plugins/core`, `plugins/cline`) moved out of `ci.yml` into
+  `.github/workflows/plugin-tests.yml`, a workflow that ships verbatim to the public repo,
+  where they previously did not run at all.
+- Hybrid search now returns chunks that have no vector — the FTS-only rows written by the
+  embed-rejection path (and by a deferred embed) — at the default threshold.
+  `search_hybrid` marks each BM25 candidate with `has_vector` and `rank_hybrid` exempts
+  vectorless candidates from the per-arm floor: the vector arm can never carry them and
+  normalized BM25 (`raw / 25.0`) rarely clears it, so the `EmbeddingInputError` recovery
+  text ("the chunk stays keyword-searchable") was not delivered. Chunks that have a vector
+  are floored exactly as before (the measured behavior is unchanged for them), and the exemption
+  retires on its own once a REEMBED pass backfills the vector.
+- Consolidation `MERGE` now writes every source fact it retires to the `-history.md`
+  sibling before mutating the file — the pre-merge text of `ids[0]` and each removed
+  `ids[1:]` line, verbatim, as `Merged into merged-<id> (date): <text> (reason: …)`
+  tagged with the source's own fact id. It was the one op of five that
+  dropped its working: SUPERSEDE, ARCHIVE and RETRACT already wrote history, so the
+  originals behind a merged conclusion survived only in `git log`, which recall
+  cannot address. The merged line itself is unchanged; a rejected or unmatched MERGE
+  still writes nothing. `docs/EXECUTOR-SPEC.md` records the contract.
+- `check_triggers` no longer raises `TypeError` on a trigger that has fired once and is
+  checked again without `cooldown_bypass`. The cooldown branch parsed
+  `last_fired` with `fromisoformat(value[:19])`, which stripped the `Z` suffix that
+  `update_trigger_fired` writes, then subtracted the resulting naive datetime from the
+  aware `_utc_now()` — so every trigger's second check crashed instead of applying its
+  cooldown. It now uses the same parse as `expires_at` (`palinode.core.expiry`): `Z` or
+  offset as written, a legacy naive string as UTC.
+- `bench/longmemeval_v2/adapter.py` — the `fts_mode: "and"` branch called the store without
+  the slice category filter, so on an extracted store the notes displaced the slices (10.8
+  notes + 2.8 slices per question instead of 6 + 10.9). Both stock-path calls now filter
+  like the OR arm; the first `and` measurement was discarded for this.
+- Ten CLI error paths now raise `click.Abort` instead of constructing and
+  discarding it, so failures exit non-zero; an AST guard prevents bare calls
+  from returning ([public #185](https://github.com/phasespace-labs/palinode/pull/185),
+  thanks [@costelEN](https://github.com/costelEN)).
+- `describe_match` now rounds match percentages half-up, matching the jq hook, its `cli/init.py`
+  copy and both TypeScript renderers. Python's `round()` was the only surface using banker's
+  rounding, so a cosine landing exactly on a half rendered one point lower there than everywhere else
+  ([#193](https://github.com/phasespace-labs/palinode/pull/193), thanks [@alorentiar](https://github.com/alorentiar)).
+- `POST /prompts/{name}/activate` now fails closed: if deactivating any sibling prompt fails, the
+  target is not activated and the endpoint returns 409 naming the file that blocked it, where it
+  previously activated the target anyway and returned 200 with two prompts left active. Rewrites
+  that already reached disk are still committed on the way out, and the sibling walk is sorted so
+  a part-way failure leaves the same state on every platform
+  ([#195](https://github.com/phasespace-labs/palinode/pull/195), thanks [@chiruu12](https://github.com/chiruu12)).
+- CLI text: the scaffolded Obsidian `_README.md` now shows the accepted re-run form
+  (`palinode init --obsidian --dir <vault-path>` — `init` takes no positional argument), and
+  `palinode reindex --help` reads as a sentence instead of "Explicitly trigger absolute
+  database rescans sequences."
+
+### Removed
+
+### Security
+
 ## [0.16.0] — 2026-09-05
 
 ### Added

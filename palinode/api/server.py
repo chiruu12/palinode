@@ -666,6 +666,8 @@ from palinode.api.routers.triggers import (  # noqa: E402,F401
 from palinode.api.routers.consolidation import (  # noqa: E402,F401
     ConsolidateRequest, ArchiveExpiredRequest, ArchiveRequest, consolidate_api,
     archive_expired_api, archive_api, split_layers_api, bootstrap_fact_ids_api,
+    RestoreRequest, UnretractRequest, ForgetWithdrawRequest,
+    restore_api, unretract_api, forget_withdraw_api,
 )
 from palinode.api.routers.git_history import (  # noqa: E402,F401
     history_api, diff_api, blame_api, rollback_api,

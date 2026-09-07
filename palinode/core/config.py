@@ -27,6 +27,13 @@ _logger = logging.getLogger("palinode.config")
 ToolSurface = Literal["core", "full"]
 VALID_TOOL_SURFACES: set[str] = {"core", "full"}
 
+# Wire dialects the embed client can speak. "ollama" is the native
+# /api/embed (+ legacy /api/embeddings) pair; "openai" is the OpenAI-compatible
+# /v1/embeddings shape served by llama.cpp (`llama-server --embedding`), vLLM,
+# and LM Studio. Validated at load time so a typo fails loud instead of
+# silently falling back to the Ollama wire format.
+VALID_EMBEDDING_DIALECTS: set[str] = {"ollama", "openai"}
+
 
 def validate_tool_surface(value: str, source: str = "tool_surface") -> ToolSurface:
     normalized = value.strip().lower()
@@ -88,6 +95,22 @@ class PrimaryEmbeddingConfig:
     dimensions: int = 1024
     timeout_seconds: int = 120
     connect_timeout_seconds: int = 10
+    # Wire protocol at `url`. "ollama" (default; back-compat) = native
+    # /api/embed with the /api/embeddings fallback. "openai" = POST
+    # {model, input} to /v1/embeddings (llama.cpp, vLLM, LM Studio) — set this
+    # when the embedding host is not Ollama. Same retry/backoff, circuit
+    # breaker, and typed per-input errors either way. Mirrors the CHAT role's
+    # `auto_summary.api` selector; no auto-detection.
+    dialect: str = "ollama"
+
+    def __post_init__(self) -> None:
+        normalized = self.dialect.strip().lower()
+        if normalized not in VALID_EMBEDDING_DIALECTS:
+            raise ValueError(
+                "embeddings.primary.dialect must be one of "
+                f"{sorted(VALID_EMBEDDING_DIALECTS)}, got {self.dialect!r}"
+            )
+        self.dialect = normalized
 
 @dataclass
 class EmbeddingsConfig:

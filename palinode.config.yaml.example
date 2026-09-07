@@ -54,7 +54,7 @@ ingestion:
 # Embeddings
 # -----------------------------------------------------------------------------
 embeddings:
-  # Embedding backend (Ollama)
+  # Embedding backend (Ollama by default)
   primary:
     model: "bge-m3"
     url: "http://localhost:11434"
@@ -62,6 +62,20 @@ embeddings:
     # Timeout for first call (model loading)
     timeout_seconds: 120
     connect_timeout_seconds: 10
+    # Wire protocol at `url`: "ollama" (default; native /api/embed with the
+    # /api/embeddings fallback) or "openai" (POST {model, input} to
+    # /v1/embeddings — llama.cpp `llama-server --embedding`, vLLM, LM Studio).
+    # No auto-detection: set it explicitly. Retry/backoff, the circuit breaker,
+    # and per-input error handling are the same either way. A `url` that
+    # already ends in /v1 is fine. Note the Ollama tag "bge-m3" is not a
+    # llama-server model name — point llama-server at a BGE-M3 GGUF instead.
+    # dialect: "ollama"
+    #
+    # Example — llama.cpp serving a BGE-M3 GGUF:
+    #   llama-server -m bge-m3-Q8_0.gguf --embedding --pooling cls -c 8192 --port 8080
+    # dialect: "openai"
+    # url: "http://localhost:8080"
+    # model: "bge-m3"          # llama-server ignores it; vLLM / LM Studio match it
 
 # -----------------------------------------------------------------------------
 # Auto-Summary

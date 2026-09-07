@@ -364,11 +364,14 @@ class PalinodeMemory(Memory):
             hits = hybrid_or(query, vec, top_k=2 * self.top_k, threshold=self.threshold,
                              hybrid_weight=self.hybrid_weight, category=slice_cat)
         elif vec:
-            hits = store.search_hybrid(kw, vec, top_k=2 * self.top_k, threshold=self.threshold,
-                                       hybrid_weight=self.hybrid_weight, include_daily=True,
-                                       record_access=False)
+            # Same category filter as the "or" arm: without it, on an extracted store the
+            # short dense notes outrank the slices and fill the slice slots (measured
+            # 2026-09-05 — 10.8 notes + 2.8 slices per question instead of 6 + 10.9).
+            hits = store.search_hybrid(kw, vec, category=slice_cat, top_k=2 * self.top_k,
+                                       threshold=self.threshold, hybrid_weight=self.hybrid_weight,
+                                       include_daily=True, record_access=False)
         else:
-            hits = store.search_fts(kw, top_k=2 * self.top_k)
+            hits = store.search_fts(kw, category=slice_cat, top_k=2 * self.top_k)
         hits, _dups = dedupe_hits(hits)
         hits = hits[: self.top_k]
         if self.neighbor_radius:
