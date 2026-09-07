@@ -227,6 +227,136 @@ def test_activate_prompt_idempotent(mock_memory_dir):
     assert get_resp.json()["active"] is True
 
 
+def _active_names(prompts_dir: str, task: str) -> list[str]:
+    """Read active state straight off disk for every prompt of one task."""
+    names = []
+    for entry in sorted(os.listdir(prompts_dir)):
+        if not entry.endswith(".md"):
+            continue
+        with open(os.path.join(prompts_dir, entry)) as f:
+            fm = yaml.safe_load(f.read().split("---")[1])
+        if fm.get("task") == task and fm.get("active") is True:
+            names.append(entry)
+    return names
+
+
+@pytest.mark.parametrize("failing", ["compaction-a", "compaction-b", "compaction-c"])
+def test_activate_prompt_fails_closed_when_a_sibling_write_fails(
+    mock_memory_dir, monkeypatch, failing
+):
+    """A failed deactivation must not leave two prompts active for one task.
+
+    Parametrised over the first, middle and last sibling, because the loop
+    aborts at a different point in each and the surviving state differs.
+    """
+    prompts_dir = os.path.join(mock_memory_dir, "prompts")
+    _write_prompt(prompts_dir, "compaction-a", task="compaction", active=True)
+    _write_prompt(prompts_dir, "compaction-b", task="compaction", active=False)
+    _write_prompt(prompts_dir, "compaction-c", task="compaction", active=False)
+    _write_prompt(prompts_dir, "compaction-target", task="compaction", active=False)
+
+    real_write = session.git_tools.write_memory_file
+
+    def flaky_write(file_path, text):
+        if os.path.basename(file_path) == f"{failing}.md":
+            raise OSError("disk went away")
+        return real_write(file_path, text)
+
+    monkeypatch.setattr(session.git_tools, "write_memory_file", flaky_write)
+
+    resp = client.post("/prompts/compaction-target/activate")
+
+    assert resp.status_code == 409
+    assert f"{failing}.md" in resp.json()["detail"]
+
+    # The invariant: at most one active prompt for the task. Zero is a valid
+    # outcome when the previously active sibling was deactivated before the
+    # failure, and both states are safe to retry from.
+    assert len(_active_names(prompts_dir, "compaction")) <= 1
+
+    # The target is the thing that must not have been activated.
+    assert "compaction-target.md" not in _active_names(prompts_dir, "compaction")
+
+
+def test_activate_prompt_fails_closed_when_the_target_write_fails(
+    mock_memory_dir, monkeypatch
+):
+    """The target is activated last, and its own write failure fails closed too."""
+    prompts_dir = os.path.join(mock_memory_dir, "prompts")
+    _write_prompt(prompts_dir, "compaction-a", task="compaction", active=True)
+    _write_prompt(prompts_dir, "compaction-target", task="compaction", active=False)
+
+    real_write = session.git_tools.write_memory_file
+
+    def flaky_write(file_path, text):
+        if os.path.basename(file_path) == "compaction-target.md":
+            raise OSError("disk went away")
+        return real_write(file_path, text)
+
+    monkeypatch.setattr(session.git_tools, "write_memory_file", flaky_write)
+
+    resp = client.post("/prompts/compaction-target/activate")
+
+    assert resp.status_code == 409
+    assert "compaction-target.md" in resp.json()["detail"]
+    assert _active_names(prompts_dir, "compaction") == []
+
+
+def test_activate_prompt_commits_partial_writes_before_failing(
+    mock_memory_dir, monkeypatch
+):
+    """_set_active writes immediately, so whatever reached disk still gets committed."""
+    prompts_dir = os.path.join(mock_memory_dir, "prompts")
+    _write_prompt(prompts_dir, "compaction-a", task="compaction", active=True)
+    _write_prompt(prompts_dir, "compaction-b", task="compaction", active=True)
+    _write_prompt(prompts_dir, "compaction-target", task="compaction", active=False)
+
+    real_write = session.git_tools.write_memory_file
+    committed: list[str] = []
+
+    def flaky_write(file_path, text):
+        if os.path.basename(file_path) == "compaction-b.md":
+            raise OSError("disk went away")
+        return real_write(file_path, text)
+
+    monkeypatch.setattr(session.git_tools, "write_memory_file", flaky_write)
+    monkeypatch.setattr(
+        session.git_tools,
+        "commit_memory_file",
+        lambda fp, msg: committed.append(os.path.basename(fp)),
+    )
+    monkeypatch.setattr(config.git, "auto_commit", True)
+
+    resp = client.post("/prompts/compaction-target/activate")
+
+    assert resp.status_code == 409
+    assert committed == ["compaction-a.md"]
+
+
+def test_activate_prompt_leaves_other_tasks_alone_when_it_fails(
+    mock_memory_dir, monkeypatch
+):
+    """A failure in one task must not touch a prompt belonging to another."""
+    prompts_dir = os.path.join(mock_memory_dir, "prompts")
+    _write_prompt(prompts_dir, "compaction-a", task="compaction", active=True)
+    _write_prompt(prompts_dir, "compaction-target", task="compaction", active=False)
+    _write_prompt(prompts_dir, "extraction-v1", task="extraction", active=True)
+
+    real_write = session.git_tools.write_memory_file
+
+    def flaky_write(file_path, text):
+        if os.path.basename(file_path) == "compaction-a.md":
+            raise OSError("disk went away")
+        return real_write(file_path, text)
+
+    monkeypatch.setattr(session.git_tools, "write_memory_file", flaky_write)
+
+    resp = client.post("/prompts/compaction-target/activate")
+
+    assert resp.status_code == 409
+    assert _active_names(prompts_dir, "extraction") == ["extraction-v1.md"]
+
+
 # ── Integration: /list excludes prompts/ ─────────────────────────────────────
 
 def test_list_memory_excludes_prompts_dir(mock_memory_dir):
