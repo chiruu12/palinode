@@ -76,6 +76,13 @@ embeddings:
     # dialect: "openai"
     # url: "http://localhost:8080"
     # model: "bge-m3"          # llama-server ignores it; vLLM / LM Studio match it
+    #
+    # Ollama's GPU path returns a NaN vector for a few exact inputs (a flash-
+    # attention precision bug in llama.cpp on cacheless encoders; the same input
+    # embeds fine on CPU). Such a rejection is retried once with num_gpu 0 and
+    # keep_alive 0, so the model does not stay CPU-resident afterwards. Off →
+    # the chunk stays keyword-only until re-embedded. Ollama dialect only.
+    # nan_cpu_retry: true
 
 # -----------------------------------------------------------------------------
 # Auto-Summary
@@ -132,6 +139,9 @@ search:
   mcp_threshold: 0.4
   # Default threshold for FastAPI searches (higher = more precision)
   api_threshold: 0.5
+  # BM25 arm floor, relative to the best keyword match in the same result set
+  # (a candidate survives when score >= fts_threshold * top_score). 0.0 = no floor.
+  fts_threshold: 0.4
   # Default number of results
   default_limit: 15
   # Status values to exclude from search results

@@ -227,11 +227,15 @@ def test_threshold_exempts_vectorless_fts_candidates():
     its BM25 score: the keyword arm is the only arm it has. A candidate with
     a vector, or with no flag at all (legacy slate), is floored as before.
     """
+    # The FTS floor is relative to the slate's best keyword score (0.30 here,
+    # floor 0.4 × 0.30 = 0.12), not the cosine threshold — so the 0.05 rows
+    # are below it, and only the vectorless one is let through.
+    top = _res("top.md", score=0.30, has_vector=True)
     fts_only = _res("fts-only.md", score=0.05, has_vector=False)
     vectored = _res("vectored.md", score=0.05, has_vector=True)
     legacy = _res("legacy.md", score=0.05)
-    out = _run([], [fts_only, vectored, legacy], threshold=0.5)
-    assert _order(out) == ["fts-only.md"]
+    out = _run([], [top, fts_only, vectored, legacy], threshold=0.5)
+    assert set(_order(out)) == {"top.md", "fts-only.md"}
 
 
 def test_vectorless_exemption_leaves_vectored_candidates_untouched():
@@ -242,12 +246,13 @@ def test_vectorless_exemption_leaves_vectored_candidates_untouched():
     """
     strong_vec = _res("strong.md", score=0.7)
     weak_vec = _res("weak.md", score=0.3, raw_score=0.3)
-    weak_fts_vectored = _res("weak.md", score=0.2, has_vector=True)
+    strong_fts = _res("strong.md", score=0.5, has_vector=True)
+    weak_fts_vectored = _res("weak.md", score=0.1, has_vector=True)   # below 0.4 × 0.5
     fts_only = _res("fts-only.md", score=0.02, has_vector=False)
 
-    baseline = _run([strong_vec, weak_vec], [weak_fts_vectored], threshold=0.5)
+    baseline = _run([strong_vec, weak_vec], [strong_fts, weak_fts_vectored], threshold=0.5)
     with_fts_only = _run(
-        [strong_vec, weak_vec], [weak_fts_vectored, fts_only], threshold=0.5
+        [strong_vec, weak_vec], [strong_fts, weak_fts_vectored, fts_only], threshold=0.5
     )
 
     def _vectored(results):

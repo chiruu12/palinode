@@ -128,19 +128,24 @@ class TestStoreLevel:
         assert poison_hit["raw_score"] is None
 
     def test_vectored_chunk_is_floored_exactly_as_before(self, tmp_store):
-        """Same BM25 band, same query — the only difference is whether the
-        chunk has a vector. The vectored one (cosine 0 to the query, BM25
-        below the floor) stays excluded; the vectorless one is returned."""
+        """Same query — the difference is whether the chunk has a vector and
+        how strong its keyword match is. The FTS floor is relative to the best
+        keyword match (``config.search.fts_threshold`` × top): the vectored
+        chunk matches one query word, lands under that floor, has cosine 0 to
+        the query, and stays excluded; the vectorless one is exempt from the
+        FTS floor and is returned however weak its BM25."""
         poison_path = _write_poison_fts_only(tmp_store)
         vectored_path = _write_vectored(
             tmp_store, "vectored",
-            "The painting of a sunset was worth every cent I paid for it.",
+            "The painting hangs in the hall.",   # one of the four query words
             _orthogonal_to_vec(),
         )
 
         fts = store.search_fts(_KEYWORD_QUERY)
         assert {h["file_path"] for h in fts} == {poison_path, vectored_path}
         assert all(h["score"] < config.search.api_threshold for h in fts)
+        by_path = {h["file_path"]: h["score"] for h in fts}
+        assert by_path[vectored_path] < config.search.fts_threshold * by_path[poison_path]
 
         hits = store.search_hybrid(
             _KEYWORD_QUERY, _VEC, threshold=config.search.api_threshold,
@@ -175,8 +180,13 @@ class TestStoreLevel:
 
     def test_exemption_retires_once_vector_is_backfilled(self, tmp_store):
         """After a REEMBED pass writes the vector, the chunk is an ordinary
-        vectored candidate again and the floor applies to it."""
+        vectored candidate again and the FTS floor applies to it. A strict
+        explicit floor (nothing clears it unless exempt) makes that visible:
+        vectorless, the chunk is returned; vectored, it is not."""
         poison_path = _write_poison_fts_only(tmp_store)
+        strict = dict(threshold=config.search.api_threshold, fts_threshold=2.0, record_access=False)
+        before = store.search_hybrid(_KEYWORD_QUERY, _VEC, **strict)
+        assert poison_path in [h["file_path"] for h in before]
 
         class _HealedEmbedder:
             def embed(self, text: str) -> list[float]:
@@ -186,10 +196,7 @@ class TestStoreLevel:
         assert [pw.reason for pw in p2.to_index] == [reconcile.REEMBED]
         assert reconcile.apply(p2, embedder=_HealedEmbedder()).vec_ok is True
 
-        hits = store.search_hybrid(
-            _KEYWORD_QUERY, _VEC, threshold=config.search.api_threshold,
-            record_access=False,
-        )
+        hits = store.search_hybrid(_KEYWORD_QUERY, _VEC, **strict)
         assert poison_path not in [h["file_path"] for h in hits]
 
 

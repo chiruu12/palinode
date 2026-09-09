@@ -653,3 +653,82 @@ def test_ping_does_not_open_or_consult_circuit():
     assert client.circuit_state(OllamaRole.EMBED) is CircuitState.CLOSED
     # And pings aren't recorded in metrics.
     assert client.metrics().get("embed", {}).get("count_5m", 0) == 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# embed — NaN rejection retried once on the CPU path (dev issue 1269)
+# ──────────────────────────────────────────────────────────────────────────
+
+_NAN_BODY = "failed to encode response: json: unsupported value: NaN"
+
+
+def _nan_then_cpu_ok(record: list[dict]):
+    """GPU-path request → 500 NaN; a request carrying options.num_gpu 0 → vector."""
+    def handler(request):
+        payload = json.loads(request.content)
+        record.append(payload)
+        if payload.get("options", {}).get("num_gpu") == 0:
+            return httpx.Response(200, json={"embeddings": [[0.1, 0.2, 0.3]]})
+        return httpx.Response(500, text=_NAN_BODY)
+    return handler
+
+
+def test_embed_nan_rejection_is_retried_once_on_cpu_with_keep_alive_zero():
+    seen: list[dict] = []
+    client, _, sleeps = make_client(_nan_then_cpu_ok(seen), retries=3)
+    assert client.embed("Dana reads Slack in the morning") == [0.1, 0.2, 0.3]
+    assert len(seen) == 2, "one GPU attempt, one CPU retry — no backoff retries in between"
+    assert sleeps == []
+    gpu, cpu = seen
+    assert "options" not in gpu
+    assert cpu["options"] == {"num_gpu": 0}
+    # Load-bearing: without keep_alive 0 the CPU-resident instance stays pinned
+    # under a long server-side keep_alive and every later caller embeds on CPU.
+    assert cpu["keep_alive"] == 0
+    assert cpu["input"] == gpu["input"] and cpu["model"] == gpu["model"]
+
+
+def test_embed_nan_on_cpu_too_raises_typed_error_after_exactly_two_calls():
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, text=_NAN_BODY)
+
+    client, _, _ = make_client(handler, retries=3)
+    with pytest.raises(EmbeddingInputError) as exc_info:
+        client.embed("poison")
+    assert calls == 2
+    assert "NaN" in exc_info.value.ollama_message
+
+
+def test_embed_nan_cpu_retry_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(config.embeddings.primary, "nan_cpu_retry", False)
+    seen: list[dict] = []
+    client, _, _ = make_client(_nan_then_cpu_ok(seen), retries=3)
+    with pytest.raises(EmbeddingInputError):
+        client.embed("poison")
+    assert len(seen) == 1
+
+
+def test_embed_cpu_retry_is_not_used_for_non_nan_input_errors():
+    # A 500 that is an input error for another reason must not trigger the CPU path.
+    seen: list[dict] = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(500, text="input is too large for this model")
+
+    client, _, _ = make_client(handler, retries=0)
+    with pytest.raises((EmbeddingInputError, OllamaError)):
+        client.embed("x" * 10)
+    assert all("options" not in p for p in seen)
+
+
+def test_nan_message_detector_is_word_bounded():
+    from palinode.core.ollama_client import _is_nan_message
+
+    assert _is_nan_message(_NAN_BODY)
+    assert _is_nan_message("value: nan")
+    assert not _is_nan_message("financial maintenance banana")

@@ -116,6 +116,7 @@ def rank_hybrid(
     include_daily: bool = False,
     date_after: str | None = None,
     date_before: str | None = None,
+    fts_threshold: float | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse and re-rank vector + BM25 candidate slates into the final hit list.
 
@@ -164,14 +165,21 @@ def rank_hybrid(
             r for r in vec_results
             if (r.get("raw_score") if r.get("raw_score") is not None else r.get("score", 0.0)) >= threshold
         ]
+    # The FTS arm has its own floor, relative to its best candidate: normalized
+    # BM25 is not on the cosine scale and its magnitude moves with corpus size,
+    # so an absolute floor discards correct keyword hits (all of them at the
+    # cosine threshold; the small-store ones at any fixed value). See
+    # ``SearchConfig.fts_threshold`` for the measurement. ``None`` = the
+    # configured default; ``0.0`` = no FTS floor.
+    fts_frac = config.search.fts_threshold if fts_threshold is None else fts_threshold
+    if fts_frac > 0.0 and fts_results:
+        top_fts = max(r.get("score", 0.0) for r in fts_results)
         # A candidate the store marked ``has_vector=False`` (an FTS-only row:
-        # per-input embed rejection, deferred embed) is exempt from the floor —
-        # the vector arm can never vouch for it, and normalized BM25 alone
-        # rarely clears the shared threshold. Anything with a vector, or
-        # without the flag at all, is floored exactly as before.
+        # per-input embed rejection, deferred embed) is exempt — the vector arm
+        # can never vouch for it, so the keyword arm is its only route in.
         fts_results = [
             r for r in fts_results
-            if r.get("score", 0.0) >= threshold or r.get("has_vector") is False
+            if r.get("score", 0.0) >= fts_frac * top_fts or r.get("has_vector") is False
         ]
 
     # Reciprocal Rank Fusion (RRF)

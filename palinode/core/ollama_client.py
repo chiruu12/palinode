@@ -32,6 +32,7 @@ pointed at it. """
 from __future__ import annotations
 
 import json
+import re
 import logging
 import random
 import threading
@@ -137,6 +138,14 @@ _CTX_OVERFLOW_PATTERNS = (
     "exceeds context",
     "num_ctx",
 )
+
+
+_NAN_RE = re.compile(r"\bnan\b", re.IGNORECASE)
+
+
+def _is_nan_message(message: str) -> bool:
+    """True for the serialiser's NaN rejection (``json: unsupported value: NaN``)."""
+    return bool(_NAN_RE.search(message or ""))
 
 
 def _is_ctx_overflow_message(message: str) -> bool:
@@ -822,8 +831,11 @@ class OllamaClient:
                 endpoint's).
             EmbeddingInputError: when the backend deterministically rejects this
                 one input (e.g. a NaN vector it cannot serialise, HTTP 500) —
-                raised immediately, no legacy-endpoint fallback (same model,
-                same input), no retry, no circuit-breaker hit.
+                raised after one CPU retry when the rejection is NaN-shaped and
+                ``embeddings.primary.nan_cpu_retry`` is on (the GPU path's F16
+                overflow is the known cause; the CPU path embeds the same input
+                correctly), otherwise immediately. No legacy-endpoint fallback
+                (same model, same input), no circuit-breaker hit.
             OllamaTimeout / OllamaUnreachable / OllamaError: on transient failure
                 after the retry/circuit policy, or an unexpected response shape.
         """
@@ -846,7 +858,14 @@ class OllamaClient:
             except OllamaInputError as e:
                 # Deterministic per-input failure (NaN vector): the legacy
                 # endpoint runs the same model on the same input, so no
-                # fallback — surface the typed per-input signal immediately.
+                # endpoint fallback. A NaN-shaped rejection gets one retry on
+                # the CPU path (see PrimaryEmbeddingConfig.nan_cpu_retry);
+                # anything else surfaces the typed per-input signal now.
+                if config.embeddings.primary.nan_cpu_retry and _is_nan_message(str(e)):
+                    vec = self._embed_cpu_retry(endpoint, payload_key, mdl, text, tmo)
+                    if vec is not None:
+                        self._embed_ok_once = True
+                        return vec
                 raise EmbeddingInputError(
                     model=mdl, text_len=len(text), ollama_message=str(e)
                 ) from e
@@ -883,6 +902,36 @@ class OllamaClient:
         raise last_exc or OllamaUnreachable(
             "embed: all endpoints exhausted", role="embed", model=mdl
         )
+
+    def _embed_cpu_retry(
+        self, endpoint: str, payload_key: str, mdl: str, text: str,
+        tmo: float | httpx.Timeout,
+    ) -> list[float] | None:
+        """One retry of a NaN-rejected input on the CPU path. ``keep_alive: 0``
+        so the CPU-resident instance unloads after this call and the next
+        normal request reloads on the GPU — without it a long server-side
+        keep_alive pins the model on the CPU for every later caller. Returns
+        the vector, or ``None`` on any failure (the caller then raises the
+        original typed error)."""
+        try:
+            data = self._request_json(
+                OllamaRole.EMBED, endpoint,
+                {"model": mdl, payload_key: text, "keep_alive": 0, "options": {"num_gpu": 0}},
+                timeout=tmo, retries=0, model=mdl, op="embed",
+            )
+        except OllamaError as e:
+            event_logger.warning(json.dumps({
+                "event": "embed_nan_cpu_retry", "op": "embed", "role": "embed",
+                "endpoint": endpoint, "model": mdl, "outcome": "failed", "error": str(e)[:200],
+            }, sort_keys=True))
+            return None
+        vec = _extract_embedding_vector(data)
+        event_logger.info(json.dumps({
+            "event": "embed_nan_cpu_retry", "op": "embed", "role": "embed",
+            "endpoint": endpoint, "model": mdl,
+            "outcome": "ok" if vec is not None else "no_vector", "text_len": len(text),
+        }, sort_keys=True))
+        return vec
 
     def embed_many(
         self, texts: list[str], *, model: str | None = None,

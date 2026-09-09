@@ -110,6 +110,7 @@ def test_every_unreleased_bullet_sits_under_a_heading() -> None:
 _FROZEN_RELEASED = {
     # Public hashes are computed from the exact published sections; public wording may
     # differ from the corresponding development changelog.
+    "0.18.0": "9fea40886aaafe23b7f5a21689ad9167a5da8c8799d63f2e5b86e38884f6afaa",
     "0.17.0": "27bb1e53b25c2fdfcb74e679134fd78cb3c64ca9b007a09d8fc020f4f507b44d",
     "0.16.0": "e9022e3c0cc2df2fed3583047de03be7a154f04d155349eec7ab6ac96880d274",
     "0.15.0": "d55d3207c1b139720afd9a59bab463cc63ae21a9fec54c5d13d04051d4fec0a9",

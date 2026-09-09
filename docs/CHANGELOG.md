@@ -10,10 +10,98 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Fixed
 
+### Removed
+
+### Security
+
+## [0.18.0] — 2026-09-09
+
+**Compatibility:** keyword recall changes. The BM25 arm of hybrid search now OR-joins the
+content words of a query (stopwords dropped; an identifier such as `CVE-2026-31889` stays an
+exact phrase), where FTS5's implicit AND previously required every word of a question to
+co-occur in one chunk. Natural-language queries reach the keyword arm for the first time, so
+`palinode search`, `/search`, and `palinode_search` can return keyword hits they never did
+before — and a query of several unrelated words now matches chunks carrying any of them,
+ranked by how many. The FTS arm also gets its own relevance floor, `search.fts_threshold`
+(default 0.4), **relative to the best keyword match** — the cosine `threshold` no longer
+applies to keyword scores, so keyword hits that were silently discarded before fusion at the
+default MCP/API thresholds now reach the results: an identifier query (`CVE-2026-31889`,
+a ticket or PR number) can
+return its chunk where it previously returned only vector neighbours. Fusion is unchanged.
+
+### Added
+
+- `bench/longmemeval_v2/` — a fifth extraction note kind, `form_schema`: one
+  structured note per form the agent saw (fields with type / required / default, sections,
+  buttons), rendered as a table so "which field is mandatory" is a lookup. The a11y digest
+  now keeps the `required` / `checked=` / `disabled` / `readonly` markers it is read from.
+  `reextract.py` runs a second extraction pass over a saved raw store — new notes, same
+  embedded slices — so a prompt change costs hours of extraction, not a rebuild.
+
+### Changed
+
+- `docs/BENCHMARKS.md` → *LongMemEval-V2* gains *Extraction grain: a form-schema note kind*
+ : the second extraction pass measured against the first on both domains.
+  Negative result — enterprise static −6.8 (an off-target form schema makes the reader
+  abstain on multi-form questions; 14 schemas per 100 trajectories), web inside the noise
+  floor. Artifacts under `bench/results/longmemeval-v2-*-formschema-2026-09-06/`.
+- `docs/BENCHMARKS.md` → *The BM25 arm, measured* carries the three-seed replicate of the
+  keyword-arm fix: stock path 41.7 → 48.2 on LongMemEval-V2 web (ranges 40.8–42.5 vs
+  47.5–49.6, disjoint), with the seed-to-seed spread stated as the noise floor. Four more
+  rows under `bench/results/`.
+
+### Fixed
+
+- The embed preflight no longer drops the first embed of every process.
+  `check_model_context` read Ollama's `/api/show` `parameters` field as a mapping, but
+  current Ollama returns it as a newline-delimited `key value` string, and the fallback was
+  evaluated eagerly — so the first embed in the API server and in the watcher raised
+  `AttributeError`, the inline index of the first save after a restart was lost, and the
+  watcher's first file was dropped for good (its retry is the same process). The field is
+  now parsed, `bert.context_length` (bge-m3 is a BERT model) counts alongside
+  `llama.context_length`, the runtime `num_ctx` wins over the architecture capability when
+  both are present (a model that reports 8192 but runs at 4096 truncates at 4096, and the
+  warning now says so), and a raise anywhere inside the preflight costs one warning line
+  instead of the payload. Found by the release-gate smoke; the unit fixtures had modelled
+  `parameters` as a dict.
+- An embed input that Ollama's GPU path rejects with a NaN vector is retried once on the
+  CPU path (`options.num_gpu: 0`, `keep_alive: 0`) before the chunk degrades to
+  keyword-only. The cause is a flash-attention precision bug in llama.cpp on
+  cacheless encoders such as `bge-m3` (upstream open); the same input embeds correctly on
+  CPU. `keep_alive: 0` is deliberate — without it a long server-side keep_alive leaves the
+  model CPU-resident for every later caller. `embeddings.primary.nan_cpu_retry: false`
+  restores the previous behaviour; Ollama dialect only.
+- Correct keyword hits were discarded before fusion at the default thresholds.
+  `rank_hybrid` floored the FTS arm at the caller's *cosine* threshold (0.4 MCP / 0.5 API),
+  but normalised BM25 is on a different scale that also moves with corpus size: on a 54-pair
+  rig only 43 % of true keyword hits cleared 0.4, and every single-identifier hit
+  (`CVE-…`, `SOW-…`, issue numbers) sat at 0.12–0.13. The FTS arm now has its own floor,
+  `search.fts_threshold` (default 0.4), **relative to the best keyword match in the result
+  set** — the true chunk is that match in 51/54 rig pairs and within 0.49× of it otherwise;
+  distractors sit at a median 0.39×. Against a copy of a live 11.8k-chunk store at MCP
+  defaults, an identifier query's chunk reached the top-10 for 16/20 identifiers (was 6/20;
+  vector-only 1/20) and 10/20 as a question (was 7/20). `fts_threshold=0.0` disables the
+  FTS floor; FTS-only rows (no vector) stay exempt as before. Documented in
+  `palinode.config.yaml.example`. The defect was filed independently as
+  [public #199](https://github.com/phasespace-labs/palinode/issues/199) by
+  [@WilliamK112](https://github.com/WilliamK112), whose
+  [#202](https://github.com/phasespace-labs/palinode/pull/202) carries the absolute-floor
+  variant and its acceptance run.
+- Hybrid search was effectively vector-only for natural-language queries: FTS5's
+  implicit AND meant *"why does consolidation skip groups?"* required all five words in one
+  chunk and the BM25 arm returned nothing — 0 of 30 sentence queries matched when the arm
+  was first measured, and on LongMemEval-V2's exact-label questions the empty arm cost 5.8
+  points against an OR-joined one. `store.fts_match_expression` now builds the MATCH
+  expression: content words OR-joined, identifiers kept as phrases, BM25 ranking by terms
+  matched. Verified on the same row: the stock path goes 42.5 → 47.5, within noise of the
+  benchmark adapter's own OR arm (48.3); row in `docs/BENCHMARKS.md`. The score
+  normalisation and per-arm threshold questions from the same issue stay open.
 - `palinode.config.yaml.example` now keeps every documented scalar value aligned with
   its corresponding dataclass default, except for the explicitly documented schedule
   and database-path representations. New installs that copy the example therefore use
-  the measured `api_threshold` of 0.5 and the current default result limit of 15.
+  the measured `api_threshold` of 0.5 and the current default result limit of 15
+  ([#201](https://github.com/phasespace-labs/palinode/pull/201),
+  thanks [@WilliamK112](https://github.com/WilliamK112)).
 
 ### Removed
 
