@@ -354,9 +354,11 @@ REGISTRY: tuple[Operation, ...] = (
             CanonicalParam(name="slug", type="string"),
             CanonicalParam(name="core", type="boolean"),
             CanonicalParam(name="source", type="string"),
-            # ADR-015 §5: write-semantics axis. "append" (default) is
-            # episodic; "replace" marks a living/current-state document. First-class
-            # on all surfaces so callers don't need to tunnel it through metadata.
+            # ADR-015 §5: write-semantics axis. On a save to an existing
+            # (category, slug): "append" keeps the prior body and adds beneath
+            # it; "replace" overwrites and marks a living/current-state
+            # document. First-class on all surfaces so callers don't need to
+            # tunnel it through metadata.
             CanonicalParam(
                 name="update_policy",
                 type="string",

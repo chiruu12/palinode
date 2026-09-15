@@ -334,6 +334,10 @@ class WriteTimeConfig:
     from CLI/plugin paths) and never blocks the save caller. Errors in
     the check are logged but never propagate to the save response.
 
+    A disk-backed job's marker is retired only when the job reports success
+    or when ``max_attempts`` handoffs have failed to produce one. The count
+    lives in the marker file, so it survives a restart.
+
     Default disabled — flip to true after validating in a dev environment.
     """
     enabled: bool = False
@@ -341,6 +345,7 @@ class WriteTimeConfig:
     check_timeout_seconds: int = 30
     pending_dir: str = ".palinode/pending"
     sweep_on_startup: bool = True
+    max_attempts: int = 3
 
 @dataclass
 class ForgetConfig:

@@ -255,6 +255,19 @@ class SeedEvidence:
     #: Whether the seed's own indexed section still matches its file at
     #: expansion time — ``stale`` when the file changed underneath the search.
     seed_freshness: str = "unknown"
+    #: The seed's own section as it reads *on disk right now*, projected to
+    #: current text — the same live read every :class:`EvidenceRecord` excerpt
+    #: comes from, carried in-process for the renderer above (same contract as
+    #: :attr:`seed_meta`; deliberately not serialized). The index chose this
+    #: seed; it does not get to supply its wording, because under
+    #: :data:`INDEX_LAG` the two are different text and only one of them is
+    #: what the file says. ``None`` when the seed file could not be read.
+    seed_text: str | None = None
+    #: SHA-256 of the seed file as read for this request — the revision
+    #: :attr:`seed_text` came from, in the ``file_sha256`` domain
+    #: (:attr:`EvidenceRecord.content_hash`), never comparable with the
+    #: indexed per-section hash the seed row carries.
+    seed_content_hash: str | None = None
     #: Read-time support checks, keyed by ref: the seed's own, and one for
     #: every replacement that could stand in its place
     #: (:mod:`palinode.core.revalidation`). Carried in-process for the
@@ -964,6 +977,25 @@ def _stored_vector(db: Any, chunk_id: str) -> list[float] | None:
     return vec if isinstance(vec, list) and vec else None
 
 
+def _seed_text(seed_row: dict[str, Any], loaded: _Loaded) -> str:
+    """The seed's own section as the *file* has it, projected to current text.
+
+    Section-scoped, because that is what the seed row is: a hit on one section
+    of a file, and answering with the whole file would change what a
+    multi-section record says for every request, lagging or not. A row whose
+    section is gone from the live file (or that names none, the shape an exact
+    ref read produces) falls back to the projected body.
+    """
+    section_id = seed_row.get("section_id")
+    if section_id:
+        match = next(
+            (s for s in loaded.sections if s["section_id"] == section_id), None
+        )
+        if match is not None:
+            return project_current_text(match["content"]).text
+    return loaded.projected_body
+
+
 def _seed_freshness(seed_row: dict[str, Any], loaded: _Loaded) -> str:
     """Does the seed's indexed section still match the file *now*?"""
     stored_hash = seed_row.get("content_hash")
@@ -1030,6 +1062,8 @@ def resolve_evidence(
                 loaded_seeds.append(None)
                 continue
             seed.seed_meta = loaded.meta
+            seed.seed_text = _seed_text(row, loaded)
+            seed.seed_content_hash = loaded.content_hash or None
             seed.seed_freshness = _seed_freshness(row, loaded)
             if seed.seed_freshness == "stale":
                 seed.reasons.add(INDEX_LAG)

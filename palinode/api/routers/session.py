@@ -18,7 +18,7 @@ from typing import Any, Literal, NoReturn
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from palinode.consolidation.fact_ids import stamp_fact_id
+from palinode.consolidation.fact_ids import document_fact_ids, stamp_fact_id
 from palinode.core import git_tools
 from palinode.core.config import config
 from palinode.core.envelope import envelope_complaint
@@ -414,11 +414,16 @@ def session_end_api(req: SessionEndRequest, request: Request = None) -> dict[str
             # `stamp_fact_id` is the same minting the `bootstrap-ids` backfill
             # uses, so the id here is the id a later backfill would produce for
             # this text and re-running it is a no-op.
-            line = stamp_fact_id(status_path, line)
+            #
+            # Read first, and mint against what is already there: the id is
+            # derived from the line's text, so a repeated summary — or the same
+            # session ending twice — would otherwise mint an id the document
+            # already carries, and an id naming two lines is not an address.
             # Same read-then-atomic-rewrite trade as the daily note above —
             # through write_memory_file, not an O_APPEND open().
             with open(status_path, encoding="utf-8") as f:
                 existing_status = f.read()
+            line = stamp_fact_id(status_path, line, document_fact_ids(existing_status))
             git_tools.write_memory_file(status_path, f"{existing_status}\n{line}\n")
             status_file = f"projects/{project}-status.md"
             logger.info(

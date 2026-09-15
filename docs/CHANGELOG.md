@@ -20,6 +20,117 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Security
 
+## [0.20.1] — 2026-09-14
+
+**Compatibility:** one behaviour change arrives without opting in. `update_policy` is
+sticky frontmatter, so a document that already carries `update_policy: append` now
+**grows on re-save** instead of being overwritten — the parameter finally does what its
+description always promised. Documents that never declared a policy are
+unaffected: a save naming no policy still overwrites, exactly as before. If a document
+stamped `append` was meant as a living, current-state document, set
+`update_policy: replace` on it before your next save. Nothing else here needs an action.
+The write-time retry bound is a new optional knob,
+`consolidation.write_time.max_attempts` (default 3). Fact markers that an earlier
+re-render already dropped are not restored retroactively: restore the id the document
+had rather than running `palinode bootstrap-ids`, which mints a new one and orphans any
+`backed_by` reference that named the old id. `palinode doctor` reports
+duplicate status-document fact ids so you can find the documents worth repairing.
+
+### Added
+
+### Changed
+
+### Fixed
+
+- **`palinode_save`'s `update_policy="append"` now appends instead of silently replacing the body.** The parameter was documented as save-time write semantics — *"Save behavior: append episodic memory or replace a living document"* — but was only a marker consumed downstream by the compaction guard, so a save with `update_policy: "append"` against an existing `(category, slug)` **overwrote the whole document**. Every visible signal said otherwise: the value validated, landed in frontmatter, `created_at` was correctly preserved, and the receipt said `(replaced)`, which reads as a status line rather than as a report that the prior body is gone. A save lost a ~90-line insight this way and recovered only because they had authored the text in the same session; a session that had merely *read* that memory would have lost it outside version history. `append` is now a real write semantic: the existing body is carried forward verbatim and the new content lands beneath it under a dated `## Update — YYYY-MM-DD` heading plus a hidden `<!-- palinode-append <timestamp> -->` marker. The H2 is load-bearing rather than decorative — the indexer splits bodies on H2/H3, so each appended block becomes its own retrievable chunk instead of swelling the tail chunk without bound — and the heading is ordinary markdown, so the compaction prompt and the fact-id tagger (both of which work over list-item lines) need no new rules. The semantic is deliberately narrow: it applies only to an **explicit or file-inherited** `append` against an **explicitly slugged** existing document. A save that declares no policy still overwrites, exactly as before — `DEFAULT_UPDATE_POLICY` names the axis's default *value*, not the behaviour of a save that never opted in, and making the implicit default append would turn every ordinary re-save (session notes, snapshots, consolidation write-backs) into a growing duplicate. A colliding *derived* slug still disambiguates into a sibling rather than appending one unrelated memory onto another. `replace` is unchanged and still marks the sticky living document that consolidation may never fork into history. There is deliberately no duplicate suppression: a repeated append leaves a visible, editable duplicate, whereas dropping it would silently discard caller content — the failure this change exists to end. `created_at` is still preserved and `last_updated` still advances; the frontmatter `content_hash` now covers the composed body, which is what is on disk. The receipts stop lying in both directions — MCP says `Appended to insights/<slug>.md`, the CLI says `Appended: …`, the plugin says `Appended to Palinode: …`, and `save_outcome` carries a new `appended` value — and the parameter's description is rewritten to match the behaviour on all four surfaces (MCP tool schema, REST `SaveRequest`, `palinode save --update-policy`, the OpenClaw plugin's TypeBox schema) plus `docs/CLI.md`. New `tests/test_append_semantics.py` (real SQLite + tmp_path) covers the reported data loss, the separator shape, per-block chunking, first-save-has-no-seam, accumulation order, sticky carry-forward, the no-policy and derived-slug non-regressions, timestamp handling, and that appended content is searchable as soon as the save returns.
+- **A replacement dated in the future no longer takes the old value down with it.** The executor tombstones a record the moment its successor is
+  written, so a successor whose declared `date` is still ahead left `resolve`
+  declining — correctly, but with nothing to answer — for the whole run-up to a
+  change that had not happened yet. The predecessor now stands until that date,
+  with `replacement_scheduled` as the reason and `superseded_from:<date>` on the
+  record, so nobody is handed a value that is about to change without being told
+  when. The answer is the same from either end of the link (the retired
+  predecessor is out of default recall, so a query usually reaches the
+  successor). Read off two declarations and the injected clock, and only when the
+  pending supersession is the *whole* of the predecessor's retirement: one that
+  also lapsed, was retracted or deprecated on its own account, or sits under
+  `archive/`, still resolves to `insufficient_evidence`, as do two predecessors
+  merging into one successor.
+- **`resolve` delivers the wording the file has, not the wording the index has.** When a file changed after it was indexed, the bundle stamped the
+  answer `index stale` and then quoted the superseded text anyway — an honest
+  label on the wrong answer. Every excerpt now comes from the same live,
+  projected read the evidence layer already does for every linked record; the
+  index chooses which records a bundle is about and no longer supplies their
+  text. No extra file read: the seed's file is read once per request either way.
+  The delivery receipt names the revision that text actually came from — the
+  `file_sha256` domain — whenever `freshness` is `stale`; `source_revisions`
+  stays in the index domain. One quiet fix rides along: a bundle seeded by
+  exact `ref` used to render that record's statement from the unparsed file, so
+  the excerpt opened with the record's own YAML frontmatter.
+- **A write-time contradiction job whose worker times out is no longer lost.**
+  The startup/idle sweep deleted a job's pending marker the moment it handed the
+  job to the worker, so a run that timed out, threw, or died with the process
+  consumed the job and nothing re-queued it — the opposite of what the marker is
+  for. The marker now survives the handoff and is deleted only by a run that
+  completes; anything else leaves it pending for the next sweep. Retries are
+  bounded by the new `consolidation.write_time.max_attempts` (default 3),
+  counted in the marker file itself so a restart cannot reset the bound; past it
+  the marker is retired to `.failed.json` with the reason logged, so a poison job
+  cannot loop forever.
+- **A fact id now names exactly one line, and the age sweep stops logging
+  `ARCHIVE unmatched` for lines it already retired.** A fact id is
+  derived from the line's text, so two byte-identical status log lines — a
+  repeated session summary, or the same session ending twice — minted the same
+  id, and an id on two lines is not an address. Both writers (session-end's
+  append and `palinode bootstrap-ids`) now mint against the ids the document
+  already carries, so a repeat gets a `-2` suffix and the first line keeps its
+  plain derived id. The age sweep emits one `ARCHIVE` per distinct id rather
+  than one per line, the executor counts retired *lines* rather than ops and
+  writes every removed line to the `-history.md` sibling, and a new
+  `status_fact_ids_unique` doctor check names the duplicates already on disk —
+  they are reported, not re-minted, because the id in the file is what existing
+  history entries and Consolidation Log lines reference.
+- `palinode stop` appended the literal `palinode-watcher.service` to its stop list, so
+  on a host whose watcher was installed under the installer's `WATCHER_UNIT_NAME`
+  override (`palinode-indexer.service`, the case `deploy/systemd/README.md` documents) it stopped
+  the API and left the watcher running — while `palinode doctor` reported that same
+  unit as healthy. The command now resolves the watcher unit the way `watcher_alive`
+  does: `systemctl is-active` on the system manager first and `--user` second, across
+  both shipped names plus the `WATCHER_UNIT_NAME` override, stopping whichever answered
+  through `sudo systemctl` or `systemctl --user` as appropriate and falling back to
+  `palinode-watcher.service` when none is active. The resolution now lives in one place
+  (`palinode/core/systemd_units.py`) so the two surfaces cannot drift apart.
+- **A status document's `_[log elided] …_` bullet keeps its fact marker when the
+  consolidation log re-renders it.** The bullet is an ordinary body
+  bullet, so `palinode bootstrap-ids` tags it like every other one — but both
+  re-render paths (the consolidation write path and `palinode repair-status`)
+  parsed the counters off the front of the line and rebuilt it from those alone,
+  dropping the `<!-- fact:… -->` marker every time another date block was
+  absorbed. That left one untagged fact in an otherwise fully tagged document,
+  invited the next bootstrap pass to mint it a *fresh* id (orphaning any
+  `backed_by` or blame reference to the old one), and added a line of noise to
+  the doctor's untagged-status-doc heuristic. The existing id is now carried
+  across the re-render; a bullet that arrives untagged still stays untagged.
+
+### Removed
+
+### Security
+
+- **The URL ingester connects to the address it vetted, closing the DNS
+  rebinding gap.** The guard resolved a hostname, approved the
+  answer, and then handed the *name* to `httpx`, which resolved it again to
+  dial — so a host that answered public on the first lookup and private on the
+  second was fetched anyway, through `/ingest-url`, `palinode ingest --url` and
+  the `palinode_ingest` MCP tool alike. Each hop now requests the vetted address
+  as a literal, carrying the hostname in `Host` and in the TLS `sni_hostname`
+  extension, so certificates are still verified against the hostname and nothing
+  re-resolves between the check and the connect. A host with several vetted
+  addresses is tried in resolution order, as the socket layer used to do. One
+  documented exception, logged when it applies: with an `HTTPS_PROXY` in effect
+  the request is tunnelled and goes by name, because a tunnel verifies the
+  certificate against its own target and pinning there would check the
+  certificate against an IP — the address vetting still runs.
+
 ## [0.20.0] — 2026-09-13
 
 **Compatibility:** the one-time `palinode prompt sync --force` the 0.19.1 notes asked for

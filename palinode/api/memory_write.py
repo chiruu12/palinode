@@ -30,6 +30,7 @@ from palinode.core.defaults import SAVE_SOURCE_HEADER
 # palinode.core.memory_write (see this module's docstring). Import them from
 # either path — they are the same objects.
 from palinode.core.memory_write import (  # noqa: F401
+    APPEND_BLOCK_MARKER_PREFIX,
     _CATEGORY_TO_ENTITY_PREFIX,
     _MEMORY_CATEGORY_DIRS,
     _SAFE_SLUG_RE,
@@ -38,6 +39,9 @@ from palinode.core.memory_write import (  # noqa: F401
     _apply_wiki_footer,
     _normalize_entities,
     _safe_wiki_slug,
+    append_block_marker,
+    compose_appended_body,
+    strip_wiki_footer,
 )
 
 logger = logging.getLogger("palinode.api")

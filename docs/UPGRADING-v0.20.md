@@ -481,7 +481,7 @@ upgrade a store with automation reading its output:
 
 Stated here so nothing has to be inferred from an absent parameter.
 
-**Deferred to v0.21, deliberately, with no half-implemented surface:**
+**Deferred to v0.22.0, deliberately, with no half-implemented surface:**
 
 - **Temporal assertions and as-of queries.** Bi-temporal validity windows —
   asking what memory held *as of* a past date, or when a claim becomes effective
@@ -523,10 +523,16 @@ release acceptance run and is stated in full, with its disposition, in
 - **A future-effective replacement does not keep the old value current until the
   transition.** The shipped policy retires the predecessor when the successor is
   written and then declines, because the successor is not yet effective. That is
-  a correct refusal, not the required answer. Deferred.
+  a correct refusal, not the required answer. **Fixed in v0.20.1** (2026-09-14):
+  a scheduled replacement now keeps the predecessor current until the successor's
+  effective date. The record's own `currency` still reads `retired` — `search`
+  and `resolve` must never disagree about the same file on the same clock — so
+  the transition is carried in the stamp, the reason and the qualifier instead.
 - **Under index lag, resolution delivers the indexed wording.** The delivery is
   honest — it is stamped `index stale` — but a reader that follows the markers
-  still takes the stale value. Deferred.
+  still takes the stale value. **Fixed in v0.20.1** (2026-09-14): the seed reads
+  through the same live, projected load as every other layer, so the excerpt is
+  the file's wording and the receipt names the revision it was read at.
 - **Nothing is claimed about semantic paraphrase recall.** The acceptance run
   seeded retrieval with a deterministic lexical stand-in embedder, identically
   for every arm, so paraphrase recall is understated and is not reported.

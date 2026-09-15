@@ -379,8 +379,14 @@ def parse_markdown(content: str) -> tuple[dict[str, Any], list[dict[str, str]]]:
 # in palinode reads it back — it exists for KU interop only.
 VALID_LIFECYCLES: tuple[str, ...] = ("active", "archived", "deprecated")
 
-# ADR-015 §2.1: write-semantics axis, orthogonal to `type`.
-#   append  — current behaviour; every save is an episodic file (the default).
+# ADR-015 §2.1: write-semantics axis, orthogonal to `type`. It governs how a
+# save to an EXISTING (folder, slug) is written:
+#   append  — the existing body is kept and the new content is added beneath it
+#             under a dated append heading; the file is an episodic log that
+#             grows. Reached only by an explicit or file-inherited `append` —
+#             DEFAULT_UPDATE_POLICY below names the axis's default *value*, not
+#             the behaviour of a save that declares no policy (that overwrites,
+#             as it always has).
 #   replace — re-saving the same (folder, slug) updates the one file in place;
 #             the file is a living/current-state document. Consolidation must
 #             never SUPERSEDE/ARCHIVE-into-history a `replace` doc (executor

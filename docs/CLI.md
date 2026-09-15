@@ -494,9 +494,16 @@ files move to `inbox/processed/`). One of `--url` or `--inbox` is required.
 Before each request — the submitted URL and every redirect target, five hops at
 most — the host is resolved and every returned address must be globally
 routable; a redirect into a private, loopback, link-local, or carrier-grade NAT
-address is refused rather than followed. The check runs before the request, not
-on the connection: the resolved address is not pinned, so a name whose answer
-changes between the check and the connect is not covered by this guard.
+address is refused rather than followed. The connection is then made to the
+address that was checked, not by name, so a host that answers with a public
+address and then a private one cannot be reached through the gap between the
+two. TLS is unaffected: the certificate is still verified against the hostname.
+
+One exception, and it is logged when it applies: with an `HTTPS_PROXY` set, the
+request is tunnelled and the connection is made by name, because a tunnel
+verifies the certificate against its own target and a pinned address there
+would mean checking the certificate against an IP. The address check still
+runs; only the pinning is skipped.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -1255,7 +1262,7 @@ README; the frontmatter fields are explained in
 | `--claim TEXT::REF::QUOTE` | none | Claim-level source anchor; read back with `blame --claims`; repeatable |
 | `--contradicts REF` | none | Typed conflict link, surfaced by `lint`; repeatable |
 | `--backed-by REF` | none | Typed evidence link; repeatable |
-| `--update-policy [append\|replace]` | `append` | `replace` marks a living document that re-saves update in place |
+| `--update-policy [append\|replace]` | unset | How a re-save to the same slug is written: `append` keeps the existing body and adds beneath it, `replace` overwrites it and marks a living document. Unset overwrites without marking |
 | `--epistemic [fact\|inference\|open_question\|unverified]` | unset | Kind of claim the memory makes |
 | `--sync / --no-sync` | async | Run the write-time contradiction check inline and report it |
 | `--format [json\|text]` | auto | Output format |
@@ -1452,15 +1459,18 @@ Output: **auto**.
 palinode stop [OPTIONS]
 ```
 
-Stop the systemd services `palinode-api.service` and `palinode-watcher.service`
-via `sudo systemctl stop`. Linux/systemd only; exits 1 where `systemctl` is
-absent. It does not stop a foreground `palinode start` — use Ctrl-C for that.
+Stop the systemd services `palinode-api.service` and the watcher unit.
+Linux/systemd only; exits 1 where `systemctl` is absent. It does not stop a
+foreground `palinode start` — use Ctrl-C for that.
 
-Those two unit names are the only ones it knows. If your watcher was installed
-under the installer's `WATCHER_UNIT_NAME` override (commonly
-`palinode-indexer.service`), stop it with `systemctl` directly — `palinode
-doctor`'s `watcher_alive` check names the manager and unit that answered, which
-is the quickest way to find out which you have.
+The watcher unit is **resolved, not assumed**: `palinode stop` asks
+`systemctl is-active` on the system manager first and `--user` second for
+`palinode-watcher.service`, `palinode-indexer.service`, and the installer's
+`WATCHER_UNIT_NAME` override when it is exported, then stops whichever answered
+— through `sudo systemctl` for a system unit and `systemctl --user` for a user
+unit. When nothing is active it falls back to `palinode-watcher.service`. This
+is the same resolution `palinode doctor`'s `watcher_alive` check uses, so the
+two cannot disagree about which unit your host runs.
 
 | Option | Default | Meaning |
 |---|---|---|

@@ -1,23 +1,29 @@
 """Hermetic unit tests for ``palinode.ingest.pipeline``.
 
-Every external seam is monkeypatched: ``httpx.get`` / ``httpx.post`` (no
-network), ``socket.getaddrinfo`` (no DNS), ``subprocess.run`` (no
-``pdftotext``), and the optional ``fitz`` import (no pymupdf). The one seam
-left real is ``git_tools.write_memory_file`` — it is a plain atomic write
-guarded to ``config.memory_dir``, so pointing the store at ``tmp_path`` is
-enough, exactly as the timestamp-consistency test for this module does.
+Every external seam is monkeypatched: the fetcher's ``httpx.Client`` (an
+``httpx.MockTransport`` stands in, so requests are built for real but no socket
+opens), ``httpx.post`` (no network), ``socket.getaddrinfo`` (no DNS),
+``urllib.request.getproxies`` (the host machine's proxy settings must not pick
+the code path), ``subprocess.run`` (no ``pdftotext``), and the optional ``fitz``
+import (no pymupdf). The one seam left real is ``git_tools.write_memory_file``
+— it is a plain atomic write guarded to ``config.memory_dir``, so pointing the
+store at ``tmp_path`` is enough, exactly as the timestamp-consistency test for
+this module does.
 
 The SSRF tests below state the guarantee rather than a recipe: every address a
-host resolves to must be globally routable, and every redirect hop is vetted
-before it is requested.
+host resolves to must be globally routable, every redirect hop is vetted before
+it is requested, and the connection goes to the address that was vetted rather
+than to the name, so a second DNS answer cannot be reached.
 """
 from __future__ import annotations
 
 import ipaddress
+import itertools
 import os
 import socket
 import sys
 import types
+import urllib.parse
 
 import httpx
 import pytest
@@ -76,6 +82,13 @@ def _resolver(table):
         return infos
 
     return getaddrinfo
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_proxy(monkeypatch):
+    """No proxy unless a test asks for one — whether the machine running the
+    tests has one configured must not decide which connection path is taken."""
+    monkeypatch.setattr(pipeline.urllib.request, "getproxies", dict)
 
 
 @pytest.fixture
@@ -211,43 +224,111 @@ def test_is_safe_url_rejects_empty_resolution(monkeypatch):
 # --- ingest_url ---
 
 
-def _patch_get(monkeypatch, response):
-    calls = []
+def _requested_url(request):
+    """The URL the fetcher meant, reassembled from what it actually sent.
 
-    def fake_get(url, **kwargs):
-        calls.append((url, kwargs))
-        return response
+    A pinned request connects to the vetted address, so ``request.url`` holds
+    an IP literal and the hostname rides in ``Host`` — that pairing *is* the
+    fix, so the tests read it rather than a recorded argument.
+    """
+    return f"{request.url.scheme}://{request.headers['host']}{request.url.raw_path.decode()}"
 
-    monkeypatch.setattr(pipeline.httpx, "get", fake_get)
-    return calls
+
+class _NotPinned(BaseException):
+    """A request went somewhere the guard had not vetted.
+
+    Deliberately not an ``Exception``: ``ingest_url`` catches those broadly, so
+    an ``AssertionError`` raised inside the transport would be logged as a
+    fetch failure and look exactly like a refusal — the one thing these tests
+    exist to tell apart.
+    """
+
+
+def _check_pinned(request):
+    """The connection target is a vetted address, and TLS still verifies the name."""
+    try:
+        address = ipaddress.ip_address(request.url.host)
+    except ValueError:
+        raise _NotPinned(f"connected by name: {request.url}") from None
+    if not address.is_global or address.is_multicast:
+        raise _NotPinned(f"connected to {address}")
+    expected = urllib.parse.urlsplit(f"//{request.headers['host']}").hostname
+    if request.extensions.get("sni_hostname") != expected:
+        raise _NotPinned(
+            f"sni_hostname {request.extensions.get('sni_hostname')!r}, expected {expected!r}"
+        )
+
+
+class _Fetches:
+    """What the pipeline asked ``httpx`` to do: how it built its client, and
+    every request that went through it."""
+
+    def __init__(self):
+        self.client_kwargs = []
+        self.requests = []
+
+    @property
+    def urls(self):
+        return [_requested_url(r) for r in self.requests]
+
+
+def _patch_client(monkeypatch, handler, *, pinned=True):
+    """Route the pipeline's fetches through an ``httpx.MockTransport``.
+
+    Only the transport is faked, so the handler sees real ``httpx.Request``
+    objects: the pinned URL, the ``Host`` header and the ``sni_hostname``
+    extension are the ones httpx would have put on the wire. No socket is
+    opened and no name is resolved. Unless *pinned* is off, every request is
+    checked for having gone to a vetted address rather than to a name.
+    """
+    fetches = _Fetches()
+    real_client = httpx.Client
+
+    def record(request):
+        fetches.requests.append(request)
+        if pinned:
+            _check_pinned(request)
+        return handler(request)
+
+    def factory(**kwargs):
+        fetches.client_kwargs.append(kwargs)
+        return real_client(transport=httpx.MockTransport(record), **kwargs)
+
+    monkeypatch.setattr(pipeline.httpx, "Client", factory)
+    return fetches
+
+
+def _patch_response(monkeypatch, *, status=200, text=LONG_BODY, headers=None):
+    """Serve the same response to every request (a fresh one each time — a
+    response body may only be read once)."""
+    return _patch_client(
+        monkeypatch, lambda request: httpx.Response(status, text=text, headers=headers)
+    )
 
 
 def _patch_hops(monkeypatch, hops):
     """Serve a ``302`` to ``hops[url]`` where one is listed, a full body
-    otherwise. Returns the list of URLs actually requested."""
-    requested = []
+    otherwise."""
 
-    def fake_get(url, **kwargs):
-        requested.append(url)
-        assert kwargs == {"timeout": 30.0, "follow_redirects": False}
+    def handler(request):
+        url = _requested_url(request)
         if url in hops:
-            return FakeResponse("", status_code=302, headers={"location": hops[url]})
-        return FakeResponse(LONG_BODY)
+            return httpx.Response(302, headers={"location": hops[url]})
+        return httpx.Response(200, text=LONG_BODY)
 
-    monkeypatch.setattr(pipeline.httpx, "get", fake_get)
-    return requested
+    return _patch_client(monkeypatch, handler)
 
 
 def _spy_vetting(monkeypatch):
     """Record every URL handed to the guard, keeping the real check."""
     vetted = []
-    real = pipeline.is_safe_url
+    real = pipeline._vetted_addresses
 
     def spy(url):
         vetted.append(url)
         return real(url)
 
-    monkeypatch.setattr(pipeline, "is_safe_url", spy)
+    monkeypatch.setattr(pipeline, "_vetted_addresses", spy)
     return vetted
 
 
@@ -255,16 +336,16 @@ def test_ingest_url_blocked_writes_nothing(store, monkeypatch, caplog):
     monkeypatch.setattr(
         pipeline.socket, "getaddrinfo", _resolver({"example.com": ["10.1.2.3"]})
     )
-    calls = _patch_get(monkeypatch, FakeResponse(LONG_BODY))
+    fetches = _patch_response(monkeypatch)
 
     assert pipeline.ingest_url("https://example.com/", "n") is None
-    assert calls == []
+    assert fetches.requests == []
     assert _research_files(store) == []
     assert "blocked by SSRF protection" in caplog.text
 
 
 def test_ingest_url_http_error_returns_none(store, public_dns, monkeypatch, caplog):
-    _patch_get(monkeypatch, FakeResponse(LONG_BODY, error=RuntimeError("503")))
+    _patch_response(monkeypatch, status=503)
 
     assert pipeline.ingest_url(PUBLIC_URL, "n") is None
     assert _research_files(store) == []
@@ -278,7 +359,7 @@ def test_ingest_url_strips_markup_and_collapses_whitespace(store, public_dns, mo
         "<body><h1>Title</h1>\n\n  <p>first   para</p>\n"
         f"<div>{LONG_BODY}</div></body></html>"
     )
-    _patch_get(monkeypatch, FakeResponse(html))
+    _patch_response(monkeypatch, text=html)
 
     path = pipeline.ingest_url(PUBLIC_URL, "page")
     _, body = _split(path)
@@ -288,7 +369,7 @@ def test_ingest_url_strips_markup_and_collapses_whitespace(store, public_dns, mo
 
 
 def test_ingest_url_too_short_returns_none(store, public_dns, monkeypatch, caplog):
-    _patch_get(monkeypatch, FakeResponse("<p>short</p>"))
+    _patch_response(monkeypatch, text="<p>short</p>")
 
     assert pipeline.ingest_url(PUBLIC_URL, "n") is None
     assert _research_files(store) == []
@@ -297,7 +378,7 @@ def test_ingest_url_too_short_returns_none(store, public_dns, monkeypatch, caplo
 
 def test_ingest_url_caps_content(store, public_dns, monkeypatch):
     monkeypatch.setattr(config.ingestion, "url_max_chars", 120)
-    _patch_get(monkeypatch, FakeResponse("x" * 500))
+    _patch_response(monkeypatch, text="x" * 500)
 
     _, body = _split(pipeline.ingest_url(PUBLIC_URL, "n"))
     assert body.strip().splitlines()[-1] == "x" * 120
@@ -306,7 +387,7 @@ def test_ingest_url_caps_content(store, public_dns, monkeypatch):
 def test_ingest_url_success_writes_frontmatter_and_vets_each_hop_itself(
     store, public_dns, monkeypatch
 ):
-    calls = _patch_get(monkeypatch, FakeResponse(LONG_BODY))
+    fetches = _patch_response(monkeypatch)
 
     path = pipeline.ingest_url(PUBLIC_URL, "My Page")
     fm, _ = _split(path)
@@ -317,7 +398,184 @@ def test_ingest_url_success_writes_frontmatter_and_vets_each_hop_itself(
     assert fm["source_file"] == ""
     # Following redirects is the fetcher's own job, one vetted hop at a time —
     # httpx must not do it for us.
-    assert calls == [(PUBLIC_URL, {"timeout": 30.0, "follow_redirects": False})]
+    assert fetches.client_kwargs == [{"timeout": 30.0, "follow_redirects": False}]
+    assert fetches.urls == [PUBLIC_URL]
+
+
+def test_ingest_url_connects_to_the_address_it_vetted(store, public_dns, monkeypatch):
+    """The request goes to the resolved address, with the name carried in
+    ``Host`` and in the TLS ``sni_hostname`` extension so the certificate is
+    still verified against the hostname."""
+    fetches = _patch_response(monkeypatch)
+
+    assert pipeline.ingest_url(PUBLIC_URL, "n") is not None
+
+    (request,) = fetches.requests
+    assert str(request.url) == f"https://{PUBLIC_IP}/article"
+    assert request.headers["host"] == "example.com"
+    assert request.extensions["sni_hostname"] == "example.com"
+
+
+def test_ingest_url_pins_ipv6_and_keeps_the_port(store, monkeypatch):
+    """An IPv6 answer is bracketed in the pinned URL and a non-default port
+    survives, in both the URL and the ``Host`` header."""
+    monkeypatch.setattr(
+        pipeline.socket, "getaddrinfo", _resolver({"v6.example.com": [PUBLIC_IPV6]})
+    )
+    fetches = _patch_response(monkeypatch)
+
+    assert pipeline.ingest_url("https://v6.example.com:8443/x", "n") is not None
+
+    (request,) = fetches.requests
+    assert str(request.url) == f"https://[{PUBLIC_IPV6}]:8443/x"
+    assert request.headers["host"] == "v6.example.com:8443"
+    assert request.extensions["sni_hostname"] == "v6.example.com"
+
+
+def test_ingest_url_is_not_reached_by_a_rebinding_second_answer(
+    store, monkeypatch
+):
+    """DNS rebinding: the host answers public once, then private. Because the
+    connection targets the address that was vetted, the second answer is never
+    resolved and never reached."""
+    answers = iter([[PUBLIC_IP], ["10.0.0.7"], ["10.0.0.7"]])
+    served = []
+
+    def getaddrinfo(host, port=None, *args, **kwargs):
+        served.append(host)
+        return _resolver({"example.com": next(answers)})(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline.socket, "getaddrinfo", getaddrinfo)
+    fetches = _patch_client(monkeypatch, lambda r: httpx.Response(200, text=LONG_BODY))
+
+    assert pipeline.ingest_url(PUBLIC_URL, "n") is not None
+
+    # One lookup, and the connection used its answer rather than asking again.
+    assert served == ["example.com"]
+    (request,) = fetches.requests
+    assert request.url.host == PUBLIC_IP
+    assert ipaddress.ip_address(request.url.host).is_global
+
+
+def test_ingest_url_rebinding_on_a_redirect_hop_is_refused(store, monkeypatch, caplog):
+    """The flip happens between vetting hop 1 and vetting hop 2: the second hop
+    is vetted on its own answer, so it is refused rather than fetched."""
+    answers = iter([[PUBLIC_IP], ["10.0.0.7"]])
+
+    def getaddrinfo(host, port=None, *args, **kwargs):
+        return _resolver({"example.com": next(answers)})(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline.socket, "getaddrinfo", getaddrinfo)
+    fetches = _patch_hops(monkeypatch, {PUBLIC_URL: "https://example.com/step-2"})
+
+    assert pipeline.ingest_url(PUBLIC_URL, "n") is None
+    assert fetches.urls == [PUBLIC_URL]
+    assert _research_files(store) == []
+    assert "blocked by SSRF protection" in caplog.text
+
+
+def test_ingest_url_falls_over_to_the_next_vetted_address(store, monkeypatch):
+    """A host with two vetted addresses whose first is unreachable still
+    fetches, the way the socket layer's own iteration used to."""
+    second = "93.184.216.35"
+    monkeypatch.setattr(
+        pipeline.socket,
+        "getaddrinfo",
+        _resolver({"example.com": [PUBLIC_IP, second]}),
+    )
+
+    def handler(request):
+        if request.url.host == PUBLIC_IP:
+            raise httpx.ConnectError("no route to host", request=request)
+        return httpx.Response(200, text=LONG_BODY)
+
+    fetches = _patch_client(monkeypatch, handler)
+
+    assert pipeline.ingest_url(PUBLIC_URL, "n") is not None
+    assert [r.url.host for r in fetches.requests] == [PUBLIC_IP, second]
+
+
+def test_ingest_url_reports_the_last_connect_failure(store, public_dns, monkeypatch):
+    """When no vetted address connects, the error surfaces rather than being
+    swallowed into a silent success."""
+
+    def handler(request):
+        raise httpx.ConnectError("no route to host", request=request)
+
+    _patch_client(monkeypatch, handler)
+
+    assert pipeline.ingest_url(PUBLIC_URL, "n") is None
+    assert _research_files(store) == []
+
+
+# --- pinning vs. proxies ---
+
+
+@pytest.mark.parametrize(
+    "url,proxies,bypass,tunnels",
+    [
+        ("https://example.com/x", {"https": "http://proxy:3128"}, False, True),
+        ("https://example.com/x", {"all": "http://proxy:3128"}, False, True),
+        ("https://example.com/x", {"https": "http://proxy:3128"}, True, False),
+        ("https://example.com/x", {"all": "socks5://proxy:1080"}, False, False),
+        ("https://example.com/x", {}, False, False),
+        ("http://example.com/x", {"https": "http://proxy:3128"}, False, False),
+    ],
+    ids=[
+        "https-proxy", "all-proxy", "no_proxy-bypass", "socks", "none", "plain-http",
+    ],
+)
+def test_tunnels_through_http_proxy(monkeypatch, url, proxies, bypass, tunnels):
+    """Only an https request carried by an HTTP ``CONNECT`` tunnel loses the
+    pin: a SOCKS proxy honours ``sni_hostname``, and plain http has no
+    certificate to verify."""
+    monkeypatch.setattr(pipeline.urllib.request, "getproxies", lambda: proxies)
+    monkeypatch.setattr(pipeline.urllib.request, "proxy_bypass", lambda host: bypass)
+
+    parsed = urllib.parse.urlparse(url)
+    assert pipeline._tunnels_through_http_proxy(parsed) is tunnels
+
+
+def test_ingest_url_connects_by_name_through_an_https_proxy(
+    store, public_dns, monkeypatch, caplog
+):
+    """The documented trade-off: httpcore verifies a tunnelled connection
+    against the ``CONNECT`` target, so pinning there would check the
+    certificate against an IP literal. The address vetting still runs and the
+    fall back to a name-based connect is logged rather than silent."""
+    monkeypatch.setattr(
+        pipeline.urllib.request, "getproxies", lambda: {"https": "http://proxy:3128"}
+    )
+    monkeypatch.setattr(pipeline.urllib.request, "proxy_bypass", lambda host: False)
+    fetches = _patch_client(
+        monkeypatch, lambda r: httpx.Response(200, text=LONG_BODY), pinned=False
+    )
+
+    assert pipeline.ingest_url(PUBLIC_URL, "n") is not None
+
+    (request,) = fetches.requests
+    assert request.url.host == "example.com"
+    assert "certificate verification" in caplog.text
+
+
+def test_ingest_url_still_refuses_a_private_host_through_a_proxy(
+    store, monkeypatch, caplog
+):
+    """Skipping the pin does not skip the guard."""
+    monkeypatch.setattr(
+        pipeline.urllib.request, "getproxies", lambda: {"https": "http://proxy:3128"}
+    )
+    monkeypatch.setattr(pipeline.urllib.request, "proxy_bypass", lambda host: False)
+    monkeypatch.setattr(
+        pipeline.socket, "getaddrinfo", _resolver({"example.com": ["10.1.2.3"]})
+    )
+    fetches = _patch_client(
+        monkeypatch, lambda r: httpx.Response(200, text=LONG_BODY), pinned=False
+    )
+
+    assert pipeline.ingest_url(PUBLIC_URL, "n") is None
+    assert fetches.requests == []
+    assert "blocked by SSRF protection" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -334,18 +592,19 @@ def test_ingest_url_refuses_redirect_to_non_global_address(
 ):
     """A redirect target is vetted like a submitted URL: a non-global one is
     never requested and nothing is written."""
-    requested = _patch_hops(monkeypatch, {PUBLIC_URL: target})
+    fetches = _patch_hops(monkeypatch, {PUBLIC_URL: target})
 
     assert pipeline.ingest_url(PUBLIC_URL, "n") is None
-    assert requested == [PUBLIC_URL]
+    assert fetches.urls == [PUBLIC_URL]
     assert _research_files(store) == []
     assert "blocked by SSRF protection" in caplog.text
 
 
 def test_ingest_url_follows_vetted_redirect_chain(store, public_dns, monkeypatch):
-    """Every hop — including a relative one — is vetted before it is fetched."""
+    """Every hop — including a relative one — is vetted before it is fetched,
+    and each one connects to the address that vetting returned."""
     vetted = _spy_vetting(monkeypatch)
-    requested = _patch_hops(
+    fetches = _patch_hops(
         monkeypatch,
         {PUBLIC_URL: "/step-2", "https://example.com/step-2": "https://example.com/final"},
     )
@@ -354,7 +613,8 @@ def test_ingest_url_follows_vetted_redirect_chain(store, public_dns, monkeypatch
 
     chain = [PUBLIC_URL, "https://example.com/step-2", "https://example.com/final"]
     assert vetted == chain
-    assert requested == chain
+    assert fetches.urls == chain
+    assert {r.url.host for r in fetches.requests} == {PUBLIC_IP}
     # The reference records the URL as submitted, not the hop it ended on.
     fm, _ = _split(path)
     assert fm["source_url"] == PUBLIC_URL
@@ -365,34 +625,30 @@ def test_ingest_url_refuses_protocol_relative_redirect_to_non_global_host(
 ):
     """A relative Location resolves against the hop it came from and is then
     vetted, so a chain that steps onto an internal host stops there."""
-    requested = _patch_hops(monkeypatch, {PUBLIC_URL: "//10.0.0.1/internal"})
+    fetches = _patch_hops(monkeypatch, {PUBLIC_URL: "//10.0.0.1/internal"})
 
     assert pipeline.ingest_url(PUBLIC_URL, "n") is None
-    assert requested == [PUBLIC_URL]
+    assert fetches.urls == [PUBLIC_URL]
     assert _research_files(store) == []
 
 
 def test_ingest_url_refuses_endless_redirect_chain(store, public_dns, monkeypatch, caplog):
-    requested = []
-
-    def fake_get(url, **kwargs):
-        requested.append(url)
-        return FakeResponse(
-            "",
-            status_code=302,
-            headers={"location": f"https://example.com/{len(requested)}"},
-        )
-
-    monkeypatch.setattr(pipeline.httpx, "get", fake_get)
+    hops = itertools.count()
+    fetches = _patch_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            302, headers={"location": f"https://example.com/{next(hops)}"}
+        ),
+    )
 
     assert pipeline.ingest_url(PUBLIC_URL, "n") is None
-    assert len(requested) == pipeline._MAX_REDIRECT_HOPS + 1
+    assert len(fetches.requests) == pipeline._MAX_REDIRECT_HOPS + 1
     assert _research_files(store) == []
     assert "Too many redirects" in caplog.text
 
 
 def test_ingest_url_refuses_redirect_without_a_location(store, public_dns, monkeypatch, caplog):
-    _patch_get(monkeypatch, FakeResponse("", status_code=302))
+    _patch_response(monkeypatch, status=302, text="")
 
     assert pipeline.ingest_url(PUBLIC_URL, "n") is None
     assert _research_files(store) == []

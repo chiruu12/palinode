@@ -412,7 +412,7 @@ When exposing the API beyond loopback (`PALINODE_API_HOST` other than `127.0.0.1
 | `POST` | `/search` | Hybrid search with filters |
 | `POST` | `/search-associative` | Entity graph traversal |
 | `POST` | `/save` | Create a typed memory file. Schema: `{content, type, slug?, entities?, title?}`. Body cap **5 MB** (override via `PALINODE_MAX_REQUEST_BYTES`). |
-| `POST` | `/ingest-url` | Fetch URL, save as research. The URL and each redirect target (five hops at most) are validated before they are requested: a host must resolve only to globally routable addresses. The connection is not pinned to the validated address. |
+| `POST` | `/ingest-url` | Fetch URL, save as research. The URL and each redirect target (five hops at most) are validated before they are requested: a host must resolve only to globally routable addresses, and the connection is made to the address that was validated rather than by name. Pinning is skipped for HTTPS requests through an HTTP CONNECT proxy; address validation still runs (see [the CLI guide](docs/CLI.md)). |
 | `GET/POST` | `/triggers` | Prospective recall triggers |
 | `POST` | `/consolidate` | Run or preview compaction |
 | `GET` | `/list` | Browse files by type |

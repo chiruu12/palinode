@@ -9,6 +9,15 @@ similar existing memories. Runs asynchronously via an in-process asyncio queue
 Errors in the check are logged but never propagate to the save caller. The
 save-never-fails invariant is load-bearing — see ADR-004 for rationale.
 
+A disk marker is the durable record of a job, so it outlives the enqueue: the
+sweep hands a copy to the worker and leaves the file in place, and only a
+completed run deletes it. A worker that times out, dies, or takes the process
+down with it therefore leaves the job pending for the next sweep instead of
+consuming it. Retries are bounded by ``write_time.max_attempts`` (3), counted
+in the marker itself so a restart cannot reset the bound; past it the marker
+is retired to ``.failed.json`` with the reason logged, because a poison job
+that loops forever and a marker that can never be cleared are both outages.
+
 The queue carries one other job kind. A ``revalidate`` item (written by
 :func:`palinode.core.revalidation.enqueue_revalidation`) is deterministic
 deferred work: it calls no LLM, re-derives its decision from live disk, and
@@ -68,6 +77,13 @@ logger.propagate = True
 # started from the API lifespan. Bounded at config.write_time.queue_max_size;
 # when full, new jobs fall through to disk-backed markers instead of blocking.
 _queue: asyncio.Queue | None = None
+
+#: Marker paths handed to the worker and not yet resolved. Deleting the marker
+#: at enqueue used to be what stopped a job being processed twice; now that the
+#: marker survives until the run reports success, this set is that guard. It is
+#: in-memory on purpose — a process that dies holds no claims, so its markers
+#: are free for the next startup sweep.
+_inflight: set[str] = set()
 
 
 def _get_queue() -> asyncio.Queue:
@@ -135,14 +151,21 @@ def schedule_contradiction_check(
 
 
 def sweep_pending_markers() -> int:
-    """Drain the disk-backed marker queue on API startup.
+    """Hand the disk-backed marker queue to the worker, oldest first.
 
     Reads all *.json files under {PALINODE_DIR}/{pending_dir}/ in timestamp
-    order, re-enqueues each one onto the in-process queue, and deletes the
-    marker on successful enqueue. If enqueue fails (queue full, etc.) the
-    marker is left in place and will be retried on the next sweep.
+    order and enqueues each one onto the in-process queue. The marker file is
+    **left on disk**: it is the job's durable record, and only a completed run
+    deletes it (`_consume_marker`, from the worker). A job whose worker times
+    out or dies is therefore still pending when the next sweep runs, which is
+    the retry ADR-004 describes.
 
-    Returns the number of markers successfully recovered.
+    Each handoff increments the marker's ``attempts`` counter before the job
+    goes on the queue. Past ``max_attempts`` the marker is retired to
+    ``.failed.json`` with the reason logged rather than retried forever. A
+    marker already in flight is skipped, not enqueued twice.
+
+    Returns the number of markers handed to the worker this pass.
     """
     cfg = config.consolidation.write_time
     if not cfg.sweep_on_startup:
@@ -156,44 +179,77 @@ def sweep_pending_markers() -> int:
         p for p in glob.glob(os.path.join(pending_dir, "*.json"))
         if not p.endswith(".failed.json")
     )
+    if not markers:
+        return 0
+
+    try:
+        queue = _get_queue()
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"write-time: sweep could not reach the queue: {e}")
+        return 0
+
+    max_attempts = max(1, cfg.max_attempts)
     recovered = 0
 
     for marker_path in markers:
+        if marker_path in _inflight:
+            continue
+
         try:
             with open(marker_path, encoding="utf-8") as f:
                 job = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
-            logger.error(
-                f"write-time: corrupt marker {marker_path}: {e} — renaming to .failed.json"
-            )
-            _mark_failed(marker_path)
+            _mark_failed(marker_path, f"corrupt marker: {e}")
             continue
 
         file_path = job.get("file_path")
         item = job.get("item")
         if not file_path or not item:
-            logger.error(
-                f"write-time: marker missing file_path or item: {marker_path}"
-            )
-            _mark_failed(marker_path)
+            _mark_failed(marker_path, "marker missing file_path or item")
             continue
 
-        try:
-            queue = _get_queue()
-            queue.put_nowait({"file_path": file_path, "item": item})
-            os.remove(marker_path)
-            recovered += 1
-        except asyncio.QueueFull:
-            # Queue is full; leave marker on disk for next sweep
+        attempts = _attempts(job)
+        if attempts >= max_attempts:
+            _mark_failed(
+                marker_path,
+                f"no successful run after {attempts} attempt(s) "
+                f"(max_attempts={max_attempts})",
+            )
+            continue
+
+        # Checked before the counter is written so a full queue costs the job
+        # a sweep, not an attempt. Nothing awaits between here and put_nowait,
+        # so no other coroutine can take the slot.
+        if queue.full():
             logger.warning(
                 f"write-time: queue full during sweep, leaving marker: {marker_path}"
             )
             break
-        except Exception as e:  # noqa: BLE001
-            logger.error(
-                f"write-time: sweep enqueue failed for {marker_path}: {e}"
+
+        job["attempts"] = attempts + 1
+        try:
+            _record_attempt(marker_path, job)
+        except OSError as e:
+            # The persisted count is what bounds the retry. Unable to write it,
+            # this job would be retried forever — retire it instead.
+            _mark_failed(marker_path, f"could not record attempt: {e}")
+            continue
+
+        try:
+            queue.put_nowait(
+                {
+                    "file_path": file_path,
+                    "item": item,
+                    "marker_path": marker_path,
+                    "attempt": job["attempts"],
+                }
             )
-            _mark_failed(marker_path)
+        except Exception as e:  # noqa: BLE001
+            _mark_failed(marker_path, f"sweep enqueue failed: {e}")
+            continue
+
+        _inflight.add(marker_path)
+        recovered += 1
 
     if recovered:
         logger.info(f"write-time: recovered {recovered} pending markers")
@@ -209,6 +265,11 @@ async def start_worker(app_state: Any) -> None:
     if not config.consolidation.write_time.enabled:
         logger.info("write-time: disabled in config, not starting worker")
         return
+
+    # A starting worker owns nothing yet: any claim left by a previous one
+    # died with it, and holding it here would make those markers permanently
+    # unsweepable.
+    _inflight.clear()
 
     # Sweep first so recovered markers are in the queue before the worker starts
     sweep_pending_markers()
@@ -273,7 +334,11 @@ def _write_marker(file_path: str, item: dict[str, Any]) -> str:
     """Atomically write a disk marker for a pending check.
 
     Format: {PALINODE_DIR}/.palinode/pending/{utc_iso}-{uuid}.json
-    Content: {"file_path": ..., "item": ..., "enqueued_at": ...}
+    Content: {"file_path": ..., "item": ..., "enqueued_at": ..., "attempts": 0}
+
+    ``attempts`` is the number of times the sweep has handed this job to a
+    worker. It lives here, not in memory, because the bound it feeds has to
+    survive the restart that a crashed worker causes.
 
     Atomic via write-to-tmp + rename.
     """
@@ -290,6 +355,7 @@ def _write_marker(file_path: str, item: dict[str, Any]) -> str:
         "file_path": file_path,
         "item": item,
         "enqueued_at": datetime.now(UTC).isoformat(),
+        "attempts": 0,
     }
 
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -298,17 +364,69 @@ def _write_marker(file_path: str, item: dict[str, Any]) -> str:
     return marker_path
 
 
-def _mark_failed(marker_path: str) -> None:
+def _attempts(job: dict[str, Any]) -> int:
+    """How many times this job has already been handed to a worker.
+
+    Markers written before the counter existed have no ``attempts`` key; they
+    start at zero and get the full bound.
+    """
+    try:
+        return max(0, int(job.get("attempts", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_attempt(marker_path: str, job: dict[str, Any]) -> None:
+    """Rewrite a marker in place with its updated attempt count.
+
+    Same write-to-tmp + rename as `_write_marker`, and the same file name, so
+    the marker keeps its position in the oldest-first sweep order. Raises
+    OSError to its caller: an attempt that cannot be recorded is not bounded,
+    and the caller retires the marker rather than retry it blind.
+    """
+    tmp_path = marker_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(job, f)
+    os.rename(tmp_path, marker_path)
+
+
+def _consume_marker(marker_path: str | None) -> None:
+    """Delete the marker of a job that ran to completion.
+
+    Success is what retires a pending marker — enqueue is not (ADR-004). A
+    marker that survives its run is retried by the next sweep, so failing to
+    delete one costs a duplicate pass, not a lost job.
+    """
+    if not marker_path:
+        return
+    try:
+        os.remove(marker_path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.error(
+            f"write-time: could not remove completed marker {marker_path}: {e}"
+        )
+
+
+def _mark_failed(marker_path: str, reason: str = "") -> None:
     """Rename a corrupt or permanently-failed marker to .failed.json.
 
     Fail-loud design: failed markers are preserved for operator review
-    rather than retried silently forever.
+    rather than retried silently forever. The reason is logged at ERROR so
+    the rename is never the only record of why the job stopped.
     """
+    if reason:
+        logger.error(
+            f"write-time: retiring marker {marker_path} to .failed.json: {reason}"
+        )
     failed_path = marker_path.replace(".json", ".failed.json")
     try:
         os.rename(marker_path, failed_path)
     except OSError as e:
         logger.error(f"write-time: could not rename failed marker: {e}")
+    finally:
+        _inflight.discard(marker_path)
 
 
 def _pending_dir() -> str:
@@ -354,6 +472,7 @@ async def _worker_loop(queue: asyncio.Queue) -> None:
 
         file_path = job.get("file_path", "<missing>")
         item = job.get("item", {})
+        marker_path = job.get("marker_path")
 
         try:
             # Run the actual LLM call in a thread — _check_contradictions is
@@ -367,12 +486,34 @@ async def _worker_loop(queue: asyncio.Queue) -> None:
                 f"write-time: file={os.path.basename(file_path)} "
                 f"ops={len(ops)} applied={result.get('applied_stats', {})}"
             )
+            # The run completed. Only now is the job's durable record spent.
+            _consume_marker(marker_path)
         except asyncio.TimeoutError:
-            logger.error(f"write-time: timeout on {file_path}")
+            logger.error(f"write-time: timeout on {file_path}{_retry_note(job)}")
         except Exception as e:  # noqa: BLE001
-            logger.error(f"write-time: job failed for {file_path}: {e}")
+            logger.error(
+                f"write-time: job failed for {file_path}: {e}{_retry_note(job)}"
+            )
         finally:
+            if marker_path:
+                _inflight.discard(marker_path)
             queue.task_done()
+
+
+def _retry_note(job: dict[str, Any]) -> str:
+    """The retry clause for a failed job's log line.
+
+    A marker-backed job is left pending for the next sweep; an in-memory one
+    has no durable record and is genuinely gone, which the log should say
+    rather than imply a recovery that will not happen.
+    """
+    if not job.get("marker_path"):
+        return " (no pending marker — job not retried)"
+    max_attempts = max(1, config.consolidation.write_time.max_attempts)
+    return (
+        f" (attempt {job.get('attempt', '?')}/{max_attempts}; "
+        f"marker left pending for the next sweep)"
+    )
 
 
 # ── Internal: actual work (sync path and worker both call this) ────────────

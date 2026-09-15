@@ -33,8 +33,8 @@ from palinode.diagnostics.checks.watcher import (
     watcher_alive,
     watcher_indexes_correct_db,
     _WATCHER_MODULE,
-    _WATCHER_SERVICES,
 )
+from palinode.core.systemd_units import WATCHER_UNIT_NAMES
 from palinode.diagnostics.types import CheckResult, DoctorContext
 
 
@@ -347,7 +347,7 @@ def _systemctl_states(active_unit: str | None) -> str:
     """Render one `systemctl is-active` state line per candidate unit."""
     return "".join(
         f"{'active' if unit == active_unit else 'inactive'}\n"
-        for unit in _WATCHER_SERVICES
+        for unit in WATCHER_UNIT_NAMES
     )
 
 

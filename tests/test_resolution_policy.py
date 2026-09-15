@@ -387,6 +387,93 @@ def test_an_unreachable_successor_is_unknown_not_the_old_value(mem):
     assert res.current is None
 
 
+def _seed_scheduled_change(mem, *, predecessor: dict | None = None) -> None:
+    """A → B through the real SUPERSEDE path, where B is declared effective later.
+
+    The shape ``supersede_record`` leaves behind when the writer dates the
+    successor forward: the executor tombstones A the moment B is written, and
+    B's own ``date`` says the change does not happen until 2027-01-01.
+    """
+    _write(mem, "decisions/ratelimit.md",
+           "# Rate limit\n\nThe API rate limit is 100 requests per minute.",
+           type="Decision", status="active", date="2026-01-20",
+           entities=["project/atlas"], **(predecessor or {}))
+    _write(mem, "decisions/ratelimit-v2.md",
+           "# Rate limit from January\n\nThe API rate limit is 500 requests per minute.",
+           type="Decision", status="active", date="2027-01-01",
+           entities=["project/atlas"])
+    archive_memory("decisions/ratelimit.md", reason="raised from January",
+                   superseded_by="decisions/ratelimit-v2")
+    _reindex(mem, "decisions/ratelimit.md")
+
+
+def test_a_scheduled_replacement_keeps_the_old_value_until_it_takes_effect(mem):
+    """A dated change has not happened until its date; the old value holds."""
+    _seed_scheduled_change(mem)
+
+    res = _resolved(mem, "decisions/ratelimit.md")
+    assert res.outcome == OUTCOME_SUPPORTED
+    assert res.current is not None and res.current.ref == "decisions/ratelimit"
+    assert "replacement_scheduled" in res.reasons
+    assert "not_yet_effective" not in res.reasons, "the seed itself is effective"
+    # The record's own declaration is not overridden: it still says retired,
+    # and the resolution says from when.
+    assert res.current.currency == "retired"
+    assert "superseded_from:2027-01-01" in res.current.qualifiers
+    # The successor stays visible — the reader is told what is coming.
+    assert "decisions/ratelimit-v2" in _refs(res.sides)
+
+    # Seeded from the successor instead — the end a query actually reaches,
+    # because the predecessor is retired and out of default recall — the same
+    # answer. Which end was seeded is not allowed to decide what is current.
+    from_successor = _resolved(mem, "decisions/ratelimit-v2.md")
+    assert from_successor.outcome == OUTCOME_SUPPORTED
+    assert from_successor.current.ref == "decisions/ratelimit"
+    assert "replacement_scheduled" in from_successor.reasons
+    assert "superseded_from:2027-01-01" in from_successor.current.qualifiers
+
+    # On the far side of the transition the successor stands, unchanged.
+    after = _resolved(mem, "decisions/ratelimit.md",
+                      now=datetime(2027, 2, 1, tzinfo=UTC))
+    assert after.outcome == OUTCOME_SUPPORTED
+    assert after.current.ref == "decisions/ratelimit-v2"
+    assert "explicit_replacement" in after.reasons
+    assert "replacement_scheduled" not in after.reasons
+
+
+def test_a_scheduled_replacement_does_not_revive_a_retracted_predecessor(mem):
+    """A value withdrawn on its own account stays withdrawn.
+
+    ``retracted`` is a retirement the writer declared about *this* record —
+    known-incorrect — not one the pending supersession caused. A successor
+    that has not arrived yet does not hand the floor back to it.
+    """
+    _seed_scheduled_change(mem)
+    _write(mem, "decisions/ratelimit.md",
+           "# Rate limit\n\nThe API rate limit is 100 requests per minute.",
+           type="Decision", status="retracted", superseded_by="decisions/ratelimit-v2",
+           date="2026-01-20", entities=["project/atlas"])
+
+    for rel in ("decisions/ratelimit.md", "decisions/ratelimit-v2.md"):
+        res = _resolved(mem, rel)
+        assert res.outcome == OUTCOME_INSUFFICIENT, rel
+        assert "not_yet_effective" in res.reasons
+        assert "replacement_scheduled" not in res.reasons
+        assert res.current is None
+
+
+def test_a_scheduled_replacement_does_not_revive_a_lapsed_predecessor(mem):
+    """Same rule for a record that ran out on its own clock."""
+    _seed_scheduled_change(
+        mem, predecessor={"expires_at": (_NOW - timedelta(days=1)).isoformat()}
+    )
+
+    res = _resolved(mem, "decisions/ratelimit.md")
+    assert res.outcome == OUTCOME_INSUFFICIENT
+    assert "not_yet_effective" in res.reasons
+    assert res.current is None
+
+
 def test_retired_with_no_successor_is_unknown(mem):
     _write(mem, "decisions/old.md", "# Old\n\nA decision nobody replaced.",
            type="Decision", status="archived", date="2026-01-05")

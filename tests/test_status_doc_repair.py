@@ -246,6 +246,35 @@ def test_repair_preserves_session_bullets_and_facts():
     assert "<!-- fact:infra-a1b2c3 -->" in repaired
 
 
+def test_repair_keeps_the_elision_bullets_own_fact_marker():
+    """The repair pass re-renders the elision bullet too, and must not re-id it.
+
+    Same defect, second caller: ``repair_status_doc`` parses the elision line
+    through the same helper as the write path and rebuilds it from the counters.
+    The bullet is a body bullet that ``bootstrap-ids`` has tagged, so dropping
+    the marker hands the next bootstrap pass a fresh id and orphans every
+    reference to the old one.
+    """
+    doc = CORRUPTED_DOC.replace(
+        "## Consolidation Log\n\n",
+        "## Consolidation Log\n\n"
+        "- _[log elided] 7 operation line(s) across 2 date block(s) — "
+        "2026-05-01 → 2026-05-30. Full detail in git history._"
+        " <!-- fact:infra-status-e1d0c9 -->\n\n",
+    )
+
+    repaired, _ = repair_status_doc(doc)
+
+    body = split_frontmatter(repaired)[1]
+    elided = [ln for ln in body.splitlines() if ln.startswith("- _[log elided]")]
+    assert len(elided) == 1
+    # Two garbage log lines were elided into it, so the counters moved — which
+    # is exactly when the marker used to fall off.
+    assert "9 operation line(s)" in elided[0]
+    assert elided[0].endswith("<!-- fact:infra-status-e1d0c9 -->")
+    assert "infra-status-e1d0c9" in fact_ids(body)
+
+
 def test_repair_reconciles_frontmatter_counts():
     repaired, _ = repair_status_doc(CORRUPTED_DOC)
     meta = _strict_parse(repaired)

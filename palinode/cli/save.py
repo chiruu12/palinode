@@ -127,10 +127,12 @@ from palinode.core.parity import MEMORY_TYPES
     type=click.Choice(["append", "replace"]),
     default=None,
     help=(
-        "Write-semantics axis (ADR-015). 'append' (default) is episodic; "
-        "'replace' marks a living/current-state document — re-saving the same "
-        "slug updates it in place and consolidation never supersedes/archives "
-        "it. Persisted as sticky frontmatter."
+        "How a save to an EXISTING slug is written (ADR-015). 'append' adds to "
+        "the document: the existing body is kept and this content lands under a "
+        "dated heading beneath it. 'replace' overwrites the body and marks a "
+        "living/current-state document consolidation never supersedes/archives. "
+        "Omit and the save overwrites without marking anything. Persisted as "
+        "sticky frontmatter, so the file remembers its regime."
     ),
 )
 @click.option(
@@ -321,7 +323,15 @@ def save(
             else:
                 # Graceful compatibility with an older API server.
                 outcome_text = None
-            label = f"Saved ({outcome_text})" if outcome_text else "Saved"
+            if save_outcome == "appended":
+                # Say the verb, not a parenthetical status — an append is a
+                # different act from an overwrite and the receipt must not read
+                # the same as one (mirrors the MCP confirmation line).
+                label = "Appended"
+            elif outcome_text:
+                label = f"Saved ({outcome_text})"
+            else:
+                label = "Saved"
             console.print(f"[green]{label}:[/green] {filename} (id: {id_str})")
             # The file is persisted (and git-committed) regardless of embedding.
             # If the inline embed didn't complete — cold/absent Ollama — say so

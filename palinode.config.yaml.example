@@ -267,6 +267,9 @@ consolidation:
     check_timeout_seconds: 30
     pending_dir: ".palinode/pending"
     sweep_on_startup: true
+    # How many times a pending marker may be handed to the worker before it
+    # is retired to .failed.json for operator review.
+    max_attempts: 3
 
   # Optional: map project entity refs to keywords for auto-grouping
   # daily notes that don't contain explicit `project/foo` entity refs.

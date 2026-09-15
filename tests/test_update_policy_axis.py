@@ -4,10 +4,11 @@ Covers:
   (a) update_policy round-trips through API / MCP-body / CLI and persists to
       frontmatter as a sticky field; the sticky field carries forward when a
       later save omits the param.
-  (b) default (append / no param) save behaviour is UNCHANGED vs current main:
-      a same-slug save overwrites in place, no update_policy frontmatter is
-      written, no sibling is minted. This is the critical regression guard —
-      update_policy is a *declaration*, not a clobber-guard, in this PR.
+  (b) no-param save behaviour is UNCHANGED: a same-slug save that declares no
+      policy overwrites in place, no update_policy frontmatter is written, no
+      sibling is minted. This is the critical regression guard — the *implicit*
+      default does not append, only an explicit or file-inherited `append`
+      does. The append semantic itself lives in `test_append_semantics.py`.
   (d) status validation accepts both existing lifecycle values and the new
       incident values (open/monitoring/resolved) without regressing
       status-based search exclusion.
@@ -153,9 +154,11 @@ def test_default_save_writes_no_update_policy_field(client):
 
 
 def test_default_same_slug_save_overwrites_in_place(client):
-    """The §2.6 clobber-guard is OUT OF SCOPE here: a same-slug append save
-    still overwrites in place (no sibling, content replaced) exactly as on
-    current main. update_policy does not change this."""
+    """A same-slug save that declares NO policy overwrites in place (no
+    sibling, content replaced). `DEFAULT_UPDATE_POLICY` names the axis's
+    default value, not the behaviour of a save that never opted in — every
+    ordinary re-save (session notes, snapshots, consolidation write-backs)
+    depends on this staying an overwrite."""
     res1 = _save(client, content="original content here.", slug="dup")
     fp1 = res1.json()["file_path"]
     res2 = _save(client, content="replacement content here.", slug="dup")

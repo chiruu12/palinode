@@ -11,10 +11,12 @@ makes faked at the infra boundary) — see that section's comment for why.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import tempfile
+import time
 from unittest.mock import patch
 
 import pytest
@@ -39,6 +41,7 @@ def tmp_palinode_dir(monkeypatch):
         monkeypatch.setattr(config.consolidation.write_time, "queue_max_size", 10)
         # Reset module-level queue state between tests
         monkeypatch.setattr(write_time, "_queue", None)
+        monkeypatch.setattr(write_time, "_inflight", set())
         yield tmp
 
 
@@ -134,7 +137,12 @@ def test_sweep_empty_pending_dir_returns_zero(tmp_palinode_dir):
 
 
 def test_sweep_recovers_markers_to_queue(tmp_palinode_dir, tmp_memory_file, sample_item):
-    """Sweeper finds marker files and re-enqueues them."""
+    """Sweeper finds marker files and enqueues them — and leaves them on disk.
+
+    Enqueue is not the point of no return (ADR-004): the marker is the job's
+    durable record, so it survives the handoff and is only spent by a run that
+    completes. The sweep records the handoff as an attempt.
+    """
 
     async def run():
         # Pre-create a marker on disk (simulates a CLI save from before API startup)
@@ -144,15 +152,37 @@ def test_sweep_recovers_markers_to_queue(tmp_palinode_dir, tmp_memory_file, samp
         recovered = write_time.sweep_pending_markers()
         assert recovered == 1
 
-        # Marker should be deleted after successful enqueue
-        assert not os.path.exists(marker)
+        # Marker stays pending until a worker reports the job done
+        assert os.path.exists(marker)
+        assert _marker(marker)["attempts"] == 1
 
-        # Queue should have the job
+        # Queue should have the job, carrying the marker it came from
         queue = write_time._get_queue()
         assert queue.qsize() == 1
         job = queue.get_nowait()
         assert job["file_path"] == tmp_memory_file
         assert job["item"] == sample_item
+        assert job["marker_path"] == marker
+        assert job["attempt"] == 1
+
+    asyncio.run(run())
+
+
+def test_sweep_does_not_hand_out_a_marker_already_in_flight(
+    tmp_palinode_dir, tmp_memory_file, sample_item
+):
+    """The marker outliving the enqueue must not mean the job runs twice.
+
+    Deleting it at enqueue used to be the de-dup guard; the in-flight claim is
+    what replaces it.
+    """
+
+    async def run():
+        write_time._write_marker(tmp_memory_file, sample_item)
+
+        assert write_time.sweep_pending_markers() == 1
+        assert write_time.sweep_pending_markers() == 0
+        assert write_time._get_queue().qsize() == 1
 
     asyncio.run(run())
 
@@ -210,6 +240,149 @@ def test_sweep_processes_markers_in_timestamp_order(tmp_palinode_dir, tmp_memory
 
         queue = write_time._get_queue()
         assert queue.qsize() == 3
+
+    asyncio.run(run())
+
+
+# ── Marker lifecycle: a job survives its worker ────────────────────────────
+#
+# ADR-004: a job whose worker times out leaves its marker in pending and is
+# retried by the next sweep. The marker is therefore retired by exactly two
+# events — a run that completed, or the attempt bound — and never by the
+# handoff itself. These drive the real `_worker_loop` against a real marker
+# file; only `_run_check_and_apply` (the LLM + executor payload) is stood in
+# for, because the unit under test is the job's lifecycle, not the check.
+
+
+def _marker(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _pending(tmp_dir: str) -> list[str]:
+    d = write_time._pending_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(
+        n for n in os.listdir(d)
+        if n.endswith(".json") and not n.endswith(".failed.json")
+    )
+
+
+async def _drain(timeout: float = 10.0) -> None:
+    """Run the real worker loop until every queued job has been accounted for."""
+    queue = write_time._get_queue()
+    task = asyncio.create_task(write_time._worker_loop(queue))
+    try:
+        await asyncio.wait_for(queue.join(), timeout=timeout)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def _hangs(*_args, **_kwargs):
+    """A payload that outlives the worker's check timeout."""
+    time.sleep(0.3)
+    return {"operations": [], "applied_stats": {}}
+
+
+def test_a_timed_out_job_stays_pending_and_the_next_sweep_retries_it(
+    tmp_palinode_dir, tmp_memory_file, sample_item, monkeypatch
+):
+    """Enqueue → worker timeout → the marker is still pending, and the next
+    sweep hands it out again. Before this fix the sweep deleted the marker at
+    enqueue, so the timeout consumed the job and nothing re-queued it."""
+    from palinode.core.config import config
+
+    monkeypatch.setattr(config.consolidation.write_time, "check_timeout_seconds", 0.05)
+    marker = write_time._write_marker(tmp_memory_file, sample_item)
+
+    async def run():
+        assert write_time.sweep_pending_markers() == 1
+        assert os.path.exists(marker), "enqueue must not consume the marker"
+
+        with patch.object(write_time, "_run_check_and_apply", _hangs):
+            await _drain()
+
+        # The worker timed out. The job is untouched and still pending.
+        assert os.path.exists(marker)
+        assert _marker(marker)["attempts"] == 1
+        assert not os.path.exists(marker.replace(".json", ".failed.json"))
+
+        # The next sweep picks it up — this is the retry ADR-004 promises.
+        assert write_time.sweep_pending_markers() == 1
+        assert _marker(marker)["attempts"] == 2
+        job = write_time._get_queue().get_nowait()
+        assert job["file_path"] == tmp_memory_file
+        assert job["item"] == sample_item
+
+    asyncio.run(run())
+
+
+def test_retries_stop_at_max_attempts_and_the_marker_is_retired(
+    tmp_palinode_dir, tmp_memory_file, sample_item, monkeypatch, caplog
+):
+    """A job that never succeeds is retried a bounded number of times and then
+    retired to .failed.json with the reason logged — a poison job must not
+    loop forever."""
+    from palinode.core.config import config
+
+    monkeypatch.setattr(config.consolidation.write_time, "max_attempts", 2)
+    marker = write_time._write_marker(tmp_memory_file, sample_item)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("check exploded")
+
+    async def run():
+        with patch.object(write_time, "_run_check_and_apply", _boom):
+            for expected_attempts in (1, 2):
+                assert write_time.sweep_pending_markers() == 1
+                await _drain()
+                assert os.path.exists(marker)
+                assert _marker(marker)["attempts"] == expected_attempts
+
+            # Bound reached: the third sweep retires it instead of retrying.
+            with caplog.at_level(logging.ERROR):
+                assert write_time.sweep_pending_markers() == 0
+
+        assert not os.path.exists(marker)
+        failed = marker.replace(".json", ".failed.json")
+        assert os.path.exists(failed)
+        assert _marker(failed)["attempts"] == 2
+        assert _marker(failed)["item"] == sample_item  # preserved for review
+        assert "no successful run after 2 attempt(s)" in caplog.text
+        assert write_time._get_queue().qsize() == 0
+
+        # And it stays retired — a .failed.json is never swept again.
+        assert write_time.sweep_pending_markers() == 0
+
+    asyncio.run(run())
+
+
+def test_a_completed_job_clears_its_marker(
+    tmp_palinode_dir, tmp_memory_file, sample_item
+):
+    """The no-regression half: a run that completes still consumes the marker,
+    leaving nothing pending and nothing failed."""
+    marker = write_time._write_marker(tmp_memory_file, sample_item)
+    ran: list[str] = []
+
+    def _ok(file_path, item):
+        ran.append(file_path)
+        return {"operations": [], "applied_stats": {"updated": 1}}
+
+    async def run():
+        assert write_time.sweep_pending_markers() == 1
+        assert os.path.exists(marker)
+
+        with patch.object(write_time, "_run_check_and_apply", _ok):
+            await _drain()
+
+        assert ran == [tmp_memory_file]
+        assert not os.path.exists(marker)
+        assert not os.path.exists(marker.replace(".json", ".failed.json"))
+        assert _pending(tmp_palinode_dir) == []
 
     asyncio.run(run())
 
@@ -493,7 +666,7 @@ def test_sweep_carries_a_revalidate_marker_through_unchanged(
         marker = write_time._write_marker(tmp_memory_file, item)
 
         assert write_time.sweep_pending_markers() == 1
-        assert not os.path.exists(marker)
+        assert os.path.exists(marker)  # spent by a completed run, not by enqueue
 
         job = write_time._get_queue().get_nowait()
         assert job["file_path"] == tmp_memory_file

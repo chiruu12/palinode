@@ -33,6 +33,7 @@ Contributions welcome via pull request. Names appear here once a PR is merged.
 - [Saket7002](https://github.com/Saket7002)
 - [Mayank Suthar](https://github.com/Mayanksuthar07)
 - [Vardhman Gupta](https://github.com/Kaap10)
+- [Utkarsh Arya](https://github.com/Utkarsh3725)
 
 ## Acknowledgements
 

@@ -45,6 +45,7 @@ from palinode.core.memory_write import (
     _TYPE_TO_CATEGORY,
     _apply_wiki_footer,
     _normalize_entities,
+    compose_appended_body,
 )
 from palinode.core.path_guard import to_rel_path
 
@@ -274,8 +275,14 @@ def save_memory(
         title: Human-readable title; overrides a metadata-supplied one.
         project: ADR-010 sugar for the ``project/<slug>`` entity.
         external_refs: SDLC object references (GitHub PR, Jira issue, …).
-        update_policy: ADR-015 §2.1 write-semantics axis. Sticky frontmatter —
-            carried forward from the existing file when omitted.
+        update_policy: ADR-015 §2.1 write-semantics axis, and a real write
+            semantic: ``"append"`` against an existing ``(category, slug)``
+            adds to that document (prior body kept verbatim, new content under
+            a dated append heading), ``"replace"`` overwrites it in place and
+            marks it a living document consolidation must not fork into
+            history. Sticky frontmatter — carried forward from the existing
+            file when omitted. A save that declares *no* policy overwrites, as
+            it always has; only an explicit (or inherited) ``append`` appends.
         sources: Source-citation quote anchors; ``quote_hash`` computed when
             absent, verified when supplied.
         epistemic: ADR-018 epistemic marker. Sticky, like ``update_policy``.
@@ -294,7 +301,8 @@ def save_memory(
 
     Returns:
         A dict carrying ``file_path``, ``rel_path``, ``id``, ``save_outcome``
-        (one of ``created``, ``resaved``, ``disambiguated``, or ``replaced``),
+        (one of ``created``, ``resaved``, ``disambiguated``, ``appended``, or
+        ``replaced``),
         ``disambiguated_from``, the index health flags
         (``indexed``/``embedded``/``indexed_vec``/``indexed_fts``), and
         ``git_committed`` — plus ``git_error`` (why the auto-commit did not
@@ -526,8 +534,6 @@ def save_memory(
         original_slug if save_outcome == "disambiguated" else None
     )
 
-    content_hash = hashlib.sha256(content.encode()).hexdigest()
-
     # Normalize entity refs: bare strings get a category prefix.
     # e.g. "palinode" → "project/palinode", "alice" → "person/alice"
     raw_entities = list(entities or [])
@@ -548,9 +554,11 @@ def save_memory(
     # created_at forward; only last_updated advances to now. A genuinely new
     # file still stamps created_at = now.
     #
-    # This is deliberately NOT gated behind update_policy (that param is PR-B):
-    # re-saving the same (category, slug) is the same logical memory, so its
-    # birth timestamp should be preserved regardless of write policy.
+    # This is deliberately NOT gated behind update_policy: re-saving the same
+    # (category, slug) is the same logical memory, so its birth timestamp
+    # should be preserved regardless of write policy. `last_updated` still
+    # advances on every save, append included — an appended document did
+    # change, and the append's own timestamp is recorded in its block marker.
     #
     # Fallback: if an existing file lacks created_at in its frontmatter, leave
     # today's behaviour (stamp now). A git-log first-commit lookup is the
@@ -558,15 +566,24 @@ def save_memory(
     created_at = _now_iso
     # ADR-015 §2.1 / §6 Q2 (both param + sticky field): the explicit param wins;
     # otherwise carry forward the existing file's sticky update_policy so the
-    # file's declared regime survives a save that omits the param. A genuinely
-    # new file with no param resolves to the DEFAULT_UPDATE_POLICY (append).
+    # file's declared regime survives a save that omits the param. A save that
+    # neither supplies a policy nor inherits one stays None — no frontmatter
+    # field is written and the write is an overwrite. DEFAULT_UPDATE_POLICY
+    # names the axis's default *value*, not that behaviour.
     # H4: resolve from param-or-metadata (validated above); the param wins.
     resolved_update_policy = _effective_update_policy
+    # The prior body, when the target already exists. Read here (the block
+    # below is already reading the file) and consumed by the append
+    # composition; left empty on any read failure, so an unreadable existing
+    # file degrades to a plain write rather than to a half-composed one.
+    _existing_body = ""
     if os.path.exists(file_path):
         try:
             from palinode.core import parser as _parser
             with open(file_path, "r", encoding="utf-8") as _existing:
-                _existing_meta, _ = _parser.parse_markdown(_existing.read())
+                _existing_raw = _existing.read()
+            _existing_meta, _ = _parser.parse_markdown(_existing_raw)
+            _, _existing_body = _parser.split_frontmatter(_existing_raw)
             _prior_created = _existing_meta.get("created_at")
             if _prior_created:
                 created_at = str(_prior_created)
@@ -591,11 +608,54 @@ def save_memory(
             # Unreadable/unparseable existing file: fail open to today's
             # behaviour (stamp now) rather than block the save. The overwrite
             # itself proceeds normally below.
+            _existing_body = ""
             logger.warning(
                 "Could not read existing created_at for %r (%s); stamping now",
                 file_path,
                 exc,
             )
+
+    # ADR-015 §2.1: `append` is a write semantic, not only a compaction marker.
+    # A save declaring `append` against an existing (category, slug) adds to
+    # that document — the prior body is carried forward verbatim and the new
+    # content lands under a dated append heading. `replace` keeps the
+    # overwrite-in-place behaviour, which is what a living document wants.
+    #
+    # Three guards on reaching this branch, each load-bearing:
+    #
+    # * `resolved_update_policy == "append"` — an *explicit* declaration (now or
+    #   sticky on the file), never the implicit default. A save that never names
+    #   a policy still overwrites, because DEFAULT_UPDATE_POLICY is `append` and
+    #   making the default append would turn every ordinary re-save — session
+    #   notes, snapshots, consolidation write-backs — into a growing duplicate.
+    # * `not slug_was_derived` — a derived slug that collides is an accident
+    #   between two *unrelated* memories (see `_disambiguate_derived_slug`),
+    #   and appending one onto the other would be worse than the disambiguation
+    #   that path already does. An explicit slug is the same logical memory.
+    # * a non-empty prior body — nothing to append to otherwise, and a first
+    #   save must not be born with a separator.
+    #
+    # There is deliberately NO duplicate suppression here: an append that
+    # arrives twice leaves a visible, editable duplicate, whereas dropping a
+    # repeated block silently discards caller content — the exact failure this
+    # change exists to end.
+    #
+    # The security scan above ran over `content`, which is correct: the prior
+    # body was scanned at its own save, and re-scanning it here would let a
+    # later pattern-list change retroactively 400 a save that adds nothing to
+    # the offending text.
+    effective_content = content
+    if (
+        resolved_update_policy == "append"
+        and not slug_was_derived
+        and target_existed
+        and _existing_body.strip()
+    ):
+        effective_content = compose_appended_body(_existing_body, content, _now_iso)
+        save_outcome = "appended"
+
+    content_hash = hashlib.sha256(effective_content.encode()).hexdigest()
+
     frontmatter_dict = {
         # AMR §4.1: the conformance declaration, REQUIRED on every record
         # written under the spec. Constant-sourced (validated above if the
@@ -746,7 +806,7 @@ def save_memory(
 
     # Layer 2 wiki contract: auto-append See also footer for any entities
     # not already referenced as [[wikilinks]] in the body.
-    body_content = _apply_wiki_footer(content, normalized_entities)
+    body_content = _apply_wiki_footer(effective_content, normalized_entities)
 
     doc = f"---\n{yaml.safe_dump(frontmatter_dict, default_flow_style=False, allow_unicode=True)}---\n\n{body_content}\n"
 
@@ -764,7 +824,11 @@ def save_memory(
     if config.auto_summary.enabled:
         is_core = bool(frontmatter_dict.get("core", False))
         has_summary = bool(frontmatter_dict.get("summary"))
-        if is_core and not has_summary and len(content) >= config.auto_summary.min_content_chars:
+        if (
+            is_core
+            and not has_summary
+            and len(effective_content) >= config.auto_summary.min_content_chars
+        ):
             summary_pending = True
 
     # Utilize auto backup procedures explicitly. One save = one per-file commit

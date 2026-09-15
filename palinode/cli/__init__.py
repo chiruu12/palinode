@@ -194,27 +194,41 @@ def stop(watcher, api):
     import subprocess
     import shutil
     from rich.console import Console
-    
+
+    from palinode.core.systemd_units import (
+        WATCHER_UNIT_NAMES,
+        resolve_active_watcher_unit,
+    )
+
     console = Console()
     
     if not shutil.which("systemctl"):
         console.print("[red]Error: 'systemctl' not found. This command requires systemd (Linux).[/red]")
         raise SystemExit(1)
         
-    services = []
+    # (unit, is_user_unit). The watcher unit is resolved, not assumed: a host
+    # installed via WATCHER_UNIT_NAME runs it as e.g. palinode-indexer.service,
+    # and stopping the hardcoded name there left the watcher running.
+    services: list[tuple[str, bool]] = []
     if api:
-        services.append("palinode-api.service")
+        services.append(("palinode-api.service", False))
     if watcher:
-        services.append("palinode-watcher.service")
-        
+        services.append(resolve_active_watcher_unit() or (WATCHER_UNIT_NAMES[0], False))
+
     if not services:
         return
-        
+
     failed = False
-    for svc in services:
-        console.print(f"[yellow]Stopping {svc}...[/yellow]")
+    for svc, user_unit in services:
+        manager = "user" if user_unit else "system"
+        console.print(f"[yellow]Stopping {svc} ({manager} manager)...[/yellow]")
+        cmd = (
+            ["systemctl", "--user", "stop", svc]
+            if user_unit
+            else ["sudo", "systemctl", "stop", svc]
+        )
         try:
-            subprocess.run(["sudo", "systemctl", "stop", svc], check=True)
+            subprocess.run(cmd, check=True)
             console.print(f"[green]✓ {svc} stopped.[/green]")
         except subprocess.CalledProcessError as e:
             failed = True

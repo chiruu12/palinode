@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import os
 import re
+from typing import MutableSet
 from palinode.core.config import config
 from palinode.core import parser, git_tools
 from palinode.core.hashing import stable_md5_hexdigest
 from palinode.core.path_guard import resolve_memory_path, to_rel_path
+from palinode.consolidation.status_doc import fact_ids as document_fact_ids
 
 #: The marker the consolidation runner harvests. Kept here, next to the code
 #: that mints it, so the writer and the reader cannot drift: a bullet the
@@ -38,7 +40,37 @@ def generate_fact_id(file_path: str, line_text: str) -> str:
     return f"{file_slug}-{content_hash}"
 
 
-def stamp_fact_id(file_path: str, line: str) -> str:
+def disambiguate_fact_id(base_id: str, taken_ids: MutableSet[str]) -> str:
+    """Return *base_id*, or the first free ``<base_id>-N`` when it is taken.
+
+    A fact id is derived from the line's text, so two lines whose rendering is
+    byte-identical — the same session summary written twice, one Codex session
+    ending twice on the same day — mint the same id, and an id that names two
+    lines is not an address. The executor addresses facts by id: an UPDATE aimed
+    at one of them rewrites both, and an ARCHIVE of one retires both, which is
+    how the first live age sweep came to log six ``ARCHIVE unmatched`` warnings
+    for five ids.
+
+    A sequence suffix rather than a re-salted hash, deliberately: the base hash
+    stays legible in the id, so two ids differing only by ``-2`` read as what
+    they are — the same text, twice — instead of as two unrelated facts.
+
+    *taken_ids* is **mutated**: the id returned is added to it, so a caller
+    stamping many lines in one pass threads a single set through and the second
+    duplicate gets ``-3`` rather than colliding again on ``-2``.
+    """
+    candidate = base_id
+    suffix = 1
+    while candidate in taken_ids:
+        suffix += 1
+        candidate = f"{base_id}-{suffix}"
+    taken_ids.add(candidate)
+    return candidate
+
+
+def stamp_fact_id(
+    file_path: str, line: str, taken_ids: MutableSet[str] | None = None
+) -> str:
     """Return *line* with its deterministic fact marker appended.
 
     The single minting point. Every surface that appends a bullet to a
@@ -47,13 +79,22 @@ def stamp_fact_id(file_path: str, line: str) -> str:
     ``bootstrap-ids`` pass would have given it — the runner harvests both the
     same way, and re-running the bootstrap over the file is a no-op.
 
+    *taken_ids* is the set of ids the destination document already carries (see
+    :func:`document_fact_ids`). Pass it and the minted id is guaranteed unique
+    within that document — the first line with a given text keeps the plain
+    derived id, a repeat gets ``-2``. Omit it and the id is derived from the
+    text alone, which mints a duplicate for a line the document already holds.
+
     Idempotent: a line that already carries a marker is returned unchanged
     (minus a trailing newline), never double-stamped.
     """
     stripped = line.rstrip("\n")
     if _MARKER_PREFIX in stripped:
         return stripped
-    return f"{stripped} {_MARKER_PREFIX}{generate_fact_id(file_path, stripped)} -->"
+    fact_id = generate_fact_id(file_path, stripped)
+    if taken_ids is not None:
+        fact_id = disambiguate_fact_id(fact_id, taken_ids)
+    return f"{stripped} {_MARKER_PREFIX}{fact_id} -->"
 
 
 def count_body_facts(file_path: str) -> tuple[int, int]:
@@ -88,6 +129,9 @@ def add_fact_ids_to_file(file_path: str) -> int:
     which is how ``entities:`` came to hold status sentences that break strict
     ``yaml.safe_load``.
 
+    Every id it mints is unique within the document: two byte-identical bullets
+    derive the same id, and an id naming two lines is not an address.
+
     Returns the number of IDs added.
     """
     with open(file_path, encoding="utf-8") as f:
@@ -95,6 +139,12 @@ def add_fact_ids_to_file(file_path: str) -> int:
 
     frontmatter_block, body = parser.split_frontmatter(content)
     lines = body.splitlines(keepends=True)
+
+    # Seeded from the whole file, not the body: a marker left in frontmatter by
+    # a pre-fix bootstrap walk is residue `repair-status` removes, but while it
+    # is there it is still an id the executor can resolve, so minting a second
+    # line onto it would be the same collision this avoids.
+    taken_ids = document_fact_ids(content)
 
     modified = False
     count = 0
@@ -105,7 +155,7 @@ def add_fact_ids_to_file(file_path: str) -> int:
         if re.match(r'^[\s]*[-*]\s+', line) and _MARKER_PREFIX not in line:
             # Through the shared stamp, so the bootstrap walk and the
             # session-end append cannot mint different ids for the same text.
-            new_lines.append(stamp_fact_id(file_path, line) + "\n")
+            new_lines.append(stamp_fact_id(file_path, line, taken_ids) + "\n")
             modified = True
             count += 1
         else:

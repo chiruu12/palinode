@@ -165,13 +165,18 @@ class SaveRequest(BaseModel):
     #: Typed as Any-value so Pydantic doesn't reject nested values before
     #: our parser helper can soft-warn and drop them.
     external_refs: dict[str, Any] | None = None
-    #: ADR-015 §2.1: write-semantics axis, orthogonal to ``type``.
-    #: ``append`` (default) keeps today's episodic behaviour; ``replace`` marks
-    #: the memory as a living/current-state document (consolidation must never
-    #: SUPERSEDE/ARCHIVE-into-history it). Persisted as sticky frontmatter so the
-    #: file declares its own regime. Does NOT change append's clobber behaviour
-    #: in this PR — a same-slug save still overwrites in place (§2.6 guard
-    #: deferred). Validated against ``VALID_UPDATE_POLICIES`` in the handler —
+    #: ADR-015 §2.1: write-semantics axis, orthogonal to ``type``. It says how a
+    #: save to an *existing* ``(category, slug)`` is written. ``append`` adds to
+    #: the document — the existing body is kept verbatim and this content lands
+    #: under a dated append heading beneath it. ``replace`` overwrites the body
+    #: in place and marks the memory a living/current-state document
+    #: (consolidation must never SUPERSEDE/ARCHIVE-into-history it). Omitting
+    #: the field overwrites without marking anything, which is what every save
+    #: that never declared a policy has always done — the implicit
+    #: ``DEFAULT_UPDATE_POLICY`` does not append; only an explicit or
+    #: file-inherited ``append`` does. Persisted as sticky frontmatter so the
+    #: file declares its own regime. Validated against
+    #: ``VALID_UPDATE_POLICIES`` in the handler —
     #: see the note on ``epistemic`` for why this is ``str`` and not a
     #: ``Literal``; ``json_schema_extra`` advertises the enum for parity.
     update_policy: str | None = Field(

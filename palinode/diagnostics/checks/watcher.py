@@ -12,7 +12,9 @@ On Linux:
     (``palinode-watcher.service`` and ``palinode-indexer.service``; the
     installer's ``WATCHER_UNIT_NAME`` override is honoured when exported).
     Falls back to scanning ``ps -ef`` for a process whose command line
-    contains ``palinode.indexer.watcher``.
+    contains ``palinode.indexer.watcher``. The unit-name and manager probing
+    lives in ``palinode.core.systemd_units`` so that ``palinode stop`` cannot
+    disagree with this check about which unit the host runs.
   - watcher_indexes_correct_db: reads ``/proc/<pid>/environ`` for the watcher
     PID to compare its PALINODE_DIR against the configured value. This catches
     the case where the watcher is restarted after a directory rename but still
@@ -29,21 +31,19 @@ On macOS:
 """
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+from palinode.core.systemd_units import (
+    MANAGERS,
+    active_unit,
+    watcher_unit_candidates,
+)
 from palinode.diagnostics.registry import register
 from palinode.diagnostics.types import CheckResult, DoctorContext
 
-# Unit names we accept, in probe order. "palinode-watcher.service" is what
-# deploy/systemd/ ships; "palinode-indexer.service" is the name real
-# deployments installed via the installer's WATCHER_UNIT_NAME override.
-_WATCHER_SERVICES = ("palinode-watcher.service", "palinode-indexer.service")
-_WATCHER_UNIT_ENV = "WATCHER_UNIT_NAME"
 _WATCHER_MODULE = "palinode.indexer.watcher"
-_SYSTEMCTL_TIMEOUT = 5
 
 
 # ---------------------------------------------------------------------------
@@ -78,51 +78,6 @@ def _find_watcher_pid() -> int | None:
                     return int(parts[1])
                 except ValueError:
                     continue
-    return None
-
-
-def _candidate_units() -> tuple[str, ...]:
-    """Return the watcher unit names to probe, in order.
-
-    ``WATCHER_UNIT_NAME`` is the installer's existing knob for renaming the
-    watcher unit (see deploy/systemd/install.sh); when it is exported, that
-    name is probed first. The ``.service`` suffix is optional.
-    """
-    override = os.environ.get(_WATCHER_UNIT_ENV, "").strip()
-    if not override:
-        return _WATCHER_SERVICES
-    if not override.endswith(".service"):
-        override = f"{override}.service"
-    return (override, *(u for u in _WATCHER_SERVICES if u != override))
-
-
-def _systemctl_active_unit(units: tuple[str, ...], *, user: bool) -> str | None:
-    """Return the first unit of *units* the given manager reports as active.
-
-    One ``systemctl is-active`` invocation covers every candidate name:
-    systemd prints one state per unit, in argument order. Returns None when
-    none are active, or when systemctl is missing, errors, or times out.
-    """
-    cmd = ["systemctl"]
-    if user:
-        cmd.append("--user")
-    cmd += ["is-active", *units]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_SYSTEMCTL_TIMEOUT,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    # strict=False on purpose: a manager that errored prints fewer states
-    # (or none) than units, and that just means "not active".
-    for unit, state in zip(units, result.stdout.split(), strict=False):
-        if state == "active":
-            return unit
     return None
 
 
@@ -168,9 +123,9 @@ def watcher_alive(ctx: DoctorContext) -> CheckResult:
 
     # Linux: try systemctl first — system manager, then --user
     if is_linux:
-        units = _candidate_units()
-        for manager, user in (("system", False), ("user", True)):
-            active = _systemctl_active_unit(units, user=user)
+        units = watcher_unit_candidates()
+        for manager, user in MANAGERS:
+            active = active_unit(units, user=user)
             if active is not None:
                 return CheckResult(
                     name="watcher_alive",

@@ -26,3 +26,4 @@ from palinode.diagnostics.checks import store_tree  # noqa: F401
 from palinode.diagnostics.checks import prompts_current  # noqa: F401
 from palinode.diagnostics.checks import consolidation_targets  # noqa: F401
 from palinode.diagnostics.checks import projection_version  # noqa: F401
+from palinode.diagnostics.checks import duplicate_fact_ids  # noqa: F401

@@ -262,10 +262,12 @@ episodes:
         evidence: [decisions/atlas-ratelimit-v2]
         note: >-
           The design's required result is that the old value remains applicable
-          until the transition. The shipped policy retires the predecessor the
-          moment the replacement is written and then declines, because the
-          successor is not yet effective. Kept as an oracle so the gap is a
-          number rather than a footnote.
+          until the transition. The executor still retires the predecessor the
+          moment the replacement is written; the resolution policy now reads a
+          successor dated forward as a scheduled change and keeps the
+          predecessor standing until that date (`replacement_scheduled`,
+          carrying `superseded_from:`). The 2026-09-12 acceptance run predates
+          that and scored this episode as a refusal.
 
   - id: future-effective-neg
     family: future_effective
@@ -1147,9 +1149,12 @@ episodes:
           The file is authoritative and says 2000; the index still holds 500.
           The acceptance here is the disclosure — whether the delivery says the
           index lags — and the behavior column records which arms nonetheless
-          hand the reader the stale wording. Every arm that renders the indexed
-          row fails behaviour here and the baseline, which reads the file,
-          passes: the one case in the corpus where reading raw bytes wins.
+          hand the reader the stale wording. Any arm that renders the indexed
+          row fails behaviour here while the baseline, which reads the file,
+          passes. The `bundle` arm now takes every excerpt from the same live
+          read the evidence layer does, so the index chooses the record and the
+          file supplies the wording; the 2026-09-12 run predates that and
+          recorded it failing beside the other resolved arms.
 
   - id: concurrent-edit-index-lag-neg
     family: concurrent_edit_index_lag

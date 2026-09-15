@@ -1302,6 +1302,24 @@ def _aged_log_lines(
     return older_than(body, cutoff), days
 
 
+def _first_per_fact_id(lines: list[LogLine]) -> list[LogLine]:
+    """*lines*, in document order, keeping the first line of each fact id.
+
+    Duplicate ids are legacy on a store minted before the writers deduplicated
+    them — nothing new mints one — so this de-duplicates the *ops*, not the
+    document: the lines it drops are removed anyway, by the op that keeps the
+    id's first occurrence.
+    """
+    seen: set[str] = set()
+    first: list[LogLine] = []
+    for line in lines:
+        if line.fact_id in seen:
+            continue
+        seen.add(line.fact_id)
+        first.append(line)
+    return first
+
+
 def _retire_aged_log_lines(
     target: str, *, dry_run: bool = False, now: datetime | None = None
 ) -> int:
@@ -1340,6 +1358,13 @@ def _retire_aged_log_lines(
         )
         return len(lines)
 
+    # One op per distinct id, in document order. A fact id is derived from the
+    # line's text, so two byte-identical log lines carry the same id — and an
+    # ARCHIVE retires every line its id names. Emitting one op per
+    # *line* therefore sent a second op after the lines were already gone, and
+    # the executor logged it, correctly, as `ARCHIVE unmatched`: six warnings
+    # for five ids on the first live sweep. The lines are still counted — the
+    # executor's `archived` counts lines, not ops.
     operations = [
         {
             "op": "ARCHIVE",
@@ -1350,7 +1375,7 @@ def _retire_aged_log_lines(
                 f"(consolidation.status_log_retention_days)"
             ),
         }
-        for line in lines
+        for line in _first_per_fact_id(lines)
     ]
     pre_apply_ids = _fact_ids_before_apply(target)
     stats = apply_operations(target, operations)

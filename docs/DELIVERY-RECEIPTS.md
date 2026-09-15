@@ -37,7 +37,7 @@ introduction is in [`HOW-MEMORY-WORKS.md` §10](HOW-MEMORY-WORKS.md#10-delivery-
 | --- | --- |
 | `ref` | The memory ref (path without `.md`). |
 | `revision` | The exact source revision, or `null` when the delivery never computed one. |
-| `revision_basis` | Which hash domain `revision` is in: `index_section_sha256` (the raw per-section hash `store.check_freshness` compares against — what a search hit carries), `file_sha256` (the whole file as read — what a `/context/prime` row and an evidence record carry), or `unknown` (the delivery never computed one). **The domains are never compared across surfaces**, which is why the basis is named on every record. |
+| `revision_basis` | Which hash domain `revision` is in: `index_section_sha256` (the raw per-section hash `store.check_freshness` compares against — what a search hit carries), `file_sha256` (the whole file as read — what a `/context/prime` row and an evidence record carry, and what a `resolve` record carries whenever `freshness` is `stale`, because under index lag the delivered text came from the file and the indexed hash describes nothing that was supplied), or `unknown` (the delivery never computed one). **The domains are never compared across surfaces**, which is why the basis is named on every record. |
 | `freshness` | Index/source agreement: `valid` / `stale` / `unknown`. `null` where the surface computes no index comparison. |
 | `currency` | Whether the assertion is in force: `current` / `unmarked` / `retired` / `contested`. |
 | `span_integrity` | Whether the record's cited quote anchors still match their sources. |

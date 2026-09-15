@@ -708,6 +708,5 @@ applicable.
 Explicit unknown op strings are silently skipped.
 
 DIVERGENCE / TODO: In this checkout,
-`palinode/consolidation/op_registry.py` is not present, despite derivation
-notes referencing it. Current executor behavior is the direct `if`/`elif`
-dispatch described above.
+`palinode/consolidation/op_registry.py` is not present. Current executor
+behavior is the direct `if`/`elif` dispatch described above.

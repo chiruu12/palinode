@@ -70,8 +70,8 @@ time from record time is what turns "what did the file say on this date" into "w
 we believe was true as of this date" — the second being the question an auditor asks.
 
 **[Idle-time consolidation](https://github.com/phasespace-labs/palinode/issues/77).** Compaction is currently invoked explicitly. Running it
-during idle periods is low-risk here specifically because the deterministic executor
-already gates every write.
+during idle periods is low-risk here because every write already passes the same
+validation and commit path.
 
 **Abstention quality.** Knowing when to return *nothing* is a memory behaviour in its
 own right. Weak-match recall where the honest answer is "no relevant memory" is a bug,

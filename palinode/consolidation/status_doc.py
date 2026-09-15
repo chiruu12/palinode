@@ -185,14 +185,26 @@ def render_log_lines(operations: list[Any], known_ids: set[str]) -> list[str]:
 
 
 class _Elision:
-    """Cumulative counter for log content collapsed out of the file."""
+    """Cumulative counter for log content collapsed out of the file.
+
+    *fact_id* is the marker the bullet already carries, carried across the
+    re-render. The elision line is an ordinary body bullet, so
+    ``bootstrap_all_fact_ids`` tags it like any other; rebuilding the line from
+    the counters alone dropped that marker every time the counts moved, leaving
+    one untagged fact in an otherwise fully tagged document and inviting the
+    next bootstrap pass to mint a *fresh* id — which would break any
+    ``backed_by``/blame reference to the old one. Preserved, never minted here:
+    a line that arrives untagged stays untagged.
+    """
 
     def __init__(self, ops: int = 0, blocks: int = 0,
-                 first: str | None = None, last: str | None = None) -> None:
+                 first: str | None = None, last: str | None = None,
+                 fact_id: str | None = None) -> None:
         self.ops = ops
         self.blocks = blocks
         self.first = first
         self.last = last
+        self.fact_id = fact_id
 
     def add(self, ops: int, blocks: int, dates: list[str]) -> None:
         self.ops += ops
@@ -206,9 +218,10 @@ class _Elision:
     def render(self) -> str:
         span = f" — {self.first} → {self.last}" if self.first and self.last else ""
         scope = f" across {self.blocks} date block(s)" if self.blocks else ""
+        marker = f" <!-- fact:{self.fact_id} -->" if self.fact_id else ""
         return (
             f"- _[log elided] {self.ops} operation line(s)"
-            f"{scope}{span}. Full detail in git history._"
+            f"{scope}{span}. Full detail in git history._{marker}"
         )
 
     def __bool__(self) -> bool:
@@ -219,11 +232,13 @@ def _parse_elision(line: str) -> _Elision | None:
     match = _ELISION_RE.match(line)
     if not match:
         return None
+    marker = _FACT_MARKER_RE.search(line)
     return _Elision(
         ops=int(match.group(1)),
         blocks=int(match.group(2) or 0),
         first=match.group(3),
         last=match.group(4),
+        fact_id=marker.group(1) if marker else None,
     )
 
 

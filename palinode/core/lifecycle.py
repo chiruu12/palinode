@@ -137,6 +137,13 @@ class Eligibility:
     superseded_by: str | None = None
     #: The record's effective moment for ordering, or ``None`` when undated.
     effective_at: datetime | None = None
+    #: Whether the record sits under ``archive/``. Reported beside
+    #: :attr:`reason` rather than only through it, because a declared
+    #: retirement outranks the path rule and therefore *hides* it: a file that
+    #: is both ``status: archived`` and under ``archive/`` says
+    #: ``status:archived``. A caller asking "was this retired by anything other
+    #: than X?" needs the signal that precedence swallowed.
+    by_path: bool = False
 
     @property
     def usable(self) -> bool:
@@ -289,6 +296,7 @@ def eligibility(
     expires_raw = _text(fm.get("expires_at"))
     superseded_by = _text(fm.get("superseded_by"))
     moment = effective_at(fm)
+    by_path = _archived_by_path(path)
 
     def _result(state: State, reason: str) -> Eligibility:
         return Eligibility(
@@ -300,6 +308,7 @@ def eligibility(
             expires_at=expires_raw,
             superseded_by=superseded_by,
             effective_at=moment,
+            by_path=by_path,
         )
 
     if expires_raw is not None and parse_expires_at(expires_raw) is not None:
@@ -312,7 +321,7 @@ def eligibility(
         return _result("retired", f"status:{status.lower()}")
     if lifecycle is not None and lifecycle.lower() in RETIRED_STATUSES:
         return _result("retired", f"lifecycle:{lifecycle.lower()}")
-    if _archived_by_path(path):
+    if by_path:
         return _result("retired", f"path:{ARCHIVE_SEGMENT}")
     if superseded_by is not None:
         return _result("retired", "superseded_by")

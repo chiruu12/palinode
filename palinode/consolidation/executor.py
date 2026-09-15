@@ -430,10 +430,12 @@ def apply_operations(file_path: str, operations: list[dict], *,
             fact_id = op.get("id")
             reason = op.get("rationale", op.get("reason", ""))
             if fact_id:
-                archived_body = _archive_fact(body, fact_id, reason, file_path)
-                if archived_body != body:
+                archived_body, removed = _archive_fact(body, fact_id, reason, file_path)
+                if removed:
                     body = archived_body
-                    stats["archived"] += 1
+                    # Lines, not ops: a duplicated id names more than one line
+                    # and all of them are gone.
+                    stats["archived"] += removed
                     retirements.append(("archive", [fact_id], reason))
                 else:
                     logger.warning(
@@ -474,11 +476,16 @@ def apply_operations(file_path: str, operations: list[dict], *,
                 stats["unmatched"] += 1
                 continue
             archived_ids: list[str] = []
-            for line in in_range:
-                archived_body = _archive_fact(body, line.fact_id, reason, file_path)
-                if archived_body != body:
+            archived_lines = 0
+            # By id, in document order, each id once: on a document carrying
+            # duplicate ids the first removal takes every line that id names,
+            # and a second pass over the same id would find nothing.
+            for fact_id in dict.fromkeys(line.fact_id for line in in_range):
+                archived_body, removed = _archive_fact(body, fact_id, reason, file_path)
+                if removed:
                     body = archived_body
-                    archived_ids.append(line.fact_id)
+                    archived_ids.append(fact_id)
+                    archived_lines += removed
             if not archived_ids:
                 # The recognizer found the lines, so this cannot happen short
                 # of a bug in one of the two; say so rather than counting a
@@ -490,14 +497,14 @@ def apply_operations(file_path: str, operations: list[dict], *,
                 )
                 stats["unmatched"] += 1
                 continue
-            stats["archived"] += len(archived_ids)
-            stats["archived_by_range"] += len(archived_ids)
+            stats["archived"] += archived_lines
+            stats["archived_by_range"] += archived_lines
             retirements.append(("archive", archived_ids, reason))
             if applied_ranges is not None:
                 applied_ranges.append(op_index)
             logger.info(
                 "ARCHIVE_BEFORE %s: retired %d dated log line(s) from %s",
-                before, len(archived_ids), file_path,
+                before, archived_lines, file_path,
             )
 
         elif op_type == "RETRACT":
@@ -692,22 +699,32 @@ def _supersede_fact(content: str, fact_id: str, new_text: str,
     return updated_content
 
 
-def _archive_fact(content: str, fact_id: str, reason: str, file_path: str) -> str:
-    """Remove a fact from the file and append it to the history file."""
-    # Extract the fact text before removing
+def _archive_fact(
+    content: str, fact_id: str, reason: str, file_path: str
+) -> tuple[str, int]:
+    """Remove a fact from the file and append it to the history file.
+
+    Returns ``(content, lines_removed)``. An id addresses *every* line carrying
+    it — that has always been the removal semantics here — so on a document with
+    duplicate ids one op retires several lines, and the count says so rather
+    than leaving the caller to report one. Each removed line is written to
+    history separately: a 6-hex id can collide across genuinely different text,
+    and recording only the first match would drop the others with no trace.
+    """
     pattern = re.compile(
         r'^([\s]*[-*]\s+)(.*?)(<!-- fact:' + re.escape(fact_id) + r' -->)\n?',
         re.MULTILINE
     )
-    match = pattern.search(content)
-    if match:
+    removed = 0
+    for match in pattern.finditer(content):
+        removed += 1
         archived_text = match.group(2).strip()
         append_to_history(file_path, fact_id,
                           f"Archived: {archived_text} (reason: {reason})")
 
     # Remove from main file
     content = pattern.sub('', content)
-    return content
+    return content, removed
 
 
 def _retract_fact(content: str, fact_id: str, reason: str, file_path: str) -> str:

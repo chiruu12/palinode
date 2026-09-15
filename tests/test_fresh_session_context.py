@@ -99,7 +99,7 @@ def populated_store(tmp_path, monkeypatch):
     # Global core memories (not project-scoped — core is a global section).
     _seed(tmp_path, "insights/core-executor.md",
           {"type": "Insight", "core": True, "title": "Deterministic executor",
-           "description": "Ops applied deterministically, not by the LLM"})
+           "description": "Operations validated and applied by the executor"})
     _seed(tmp_path, "decisions/adopt-rrf.md",
           {"type": "Decision", "core": True, "title": "Adopt RRF fusion",
            "description": "Hybrid BM25 + vector fused with RRF"})

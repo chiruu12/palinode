@@ -614,10 +614,12 @@ const palinodePlugin = {
               [Type.Literal("append"), Type.Literal("replace")],
               {
                 description:
-                  "Write-semantics axis (ADR-015). 'append' (default) is episodic. " +
-                  "'replace' marks this as a living/current-state document: re-saving " +
-                  "the same slug updates it in place and consolidation will never " +
-                  "supersede/archive it into history. Persisted as sticky frontmatter.",
+                  "How a save to an EXISTING slug is written (ADR-015). 'append' adds " +
+                  "to the document: the existing body is kept and this content lands " +
+                  "under a dated heading beneath it. 'replace' overwrites the body and " +
+                  "marks this a living/current-state document that consolidation will " +
+                  "never supersede/archive into history. Omit and the save overwrites " +
+                  "without marking anything. Persisted as sticky frontmatter.",
               },
             ),
           ),
@@ -689,11 +691,19 @@ const palinodePlugin = {
               },
             );
 
+            // An append is a different act from an overwrite, so the receipt
+            // says which one happened. The MCP and CLI receipts do the same:
+            // a caller who asked for `update_policy: append` must be able to
+            // tell from the reply whether their prior body survived.
+            const verb =
+              result.save_outcome === "appended"
+                ? "Appended to Palinode"
+                : "Saved to Palinode";
             return {
               content: [
                 {
                   type: "text",
-                  text: `Saved to Palinode: ${result.file_path} (${result.id})`,
+                  text: `${verb}: ${result.file_path} (${result.id})`,
                 },
               ],
             };

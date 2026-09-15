@@ -96,6 +96,9 @@ def test_save_defaults_source_to_cli(mock_memory_dir):
             "shared-opening",
             "Saved (disambiguated from shared-opening): insights/shared-opening-2.md",
         ),
+        # An append gets its own verb, not a parenthetical status — the same
+        # honesty contract the MCP confirmation line carries.
+        ("appended", None, "Appended: insights/pinned-note.md"),
     ],
 )
 def test_save_human_output_reports_outcome(
@@ -106,9 +109,9 @@ def test_save_human_output_reports_outcome(
         mock_save.return_value = {
             "file_path": "/tmp/result.md",
             "rel_path": (
-                "insights/pinned-note.md"
-                if save_outcome == "replaced"
-                else "insights/shared-opening-2.md"
+                "insights/shared-opening-2.md"
+                if save_outcome == "disambiguated"
+                else "insights/pinned-note.md"
             ),
             "id": "insights-result",
             "save_outcome": save_outcome,

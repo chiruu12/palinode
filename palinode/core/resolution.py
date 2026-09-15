@@ -30,6 +30,17 @@ Only **mechanically explicit** changes retire a record or pick a winner:
   paths write these), and
 * ``expires_at`` in the past, on the injected clock.
 
+A replacement the writer **dated forward** has not happened yet, and the
+record it will replace is still the last value in force until it does
+(``replacement_scheduled``). The executor tombstones a record the moment its
+successor is written, so this is read off two declarations and a clock — the
+supersession link, the successor's own ``date``, and ``now`` — and only when
+that pending supersession is the *whole* of the predecessor's retirement. A
+predecessor that also ran out (``expires_at``), was retracted or deprecated on
+its own account, or sits under ``archive/`` keeps the answer it had: unknown.
+The transition rides on the standing record as ``superseded_from:<date>``, so
+nobody is handed a value that is about to change without being told when.
+
 Everything else is *advisory*. A ``contradicts`` link (including one the
 compaction model proposed through ``PROPOSE_CONTRADICTS``) makes a conflict
 **visible** — it can put a record on the ``sides`` list — but it cannot retire
@@ -134,11 +145,12 @@ back the value a retired source used to carry — the same rule
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Mapping
 
 from palinode.core.claims import parse_claims
+from palinode.core.lifecycle import RETIRED_STATUSES as _RETIRED_STATUSES
 from palinode.core.lifecycle import Eligibility, eligibility, parse_moment
 from palinode.core.parser import parse_sources
 from palinode.core.typed_links import parse_link_refs
@@ -179,12 +191,19 @@ INCOMPARABLE_OBSERVATIONS = "incomparable_observations"
 NO_EXPLICIT_CHANGE = "no_explicit_change"
 EXPIRED = "expired"
 NOT_YET_EFFECTIVE = "not_yet_effective"
+REPLACEMENT_SCHEDULED = "replacement_scheduled"
 REPLACEMENT_WITHDRAWN = "replacement_withdrawn"
 REPLACEMENT_UNRESOLVED = "replacement_unresolved"
 RETIRED_NO_SUCCESSOR = "retired_no_successor"
 SUPPORT_WITHDRAWN = "support_withdrawn"
 SUPPORT_DISPROVEN = "support_disproven"
 NO_ELIGIBLE_EVIDENCE = "no_eligible_evidence"
+
+#: Qualifier prefix for a record whose supersession is dated in the future:
+#: ``superseded_from:<YYYY-MM-DD>``. It rides on the record that still stands,
+#: so a reader is never handed a value that is about to change without being
+#: told when. Read by the bundle renderer; nothing else derives from it.
+SUPERSEDED_FROM = "superseded_from"
 
 # Qualifying reasons — they ride along and are never the whole story.
 UNDATED = "undated"
@@ -200,7 +219,8 @@ LINEAGE_UNKNOWN = "lineage_unknown"
 REASONS: frozenset[str] = frozenset({
     EXPLICIT_REPLACEMENT, UNCONTESTED, PROPOSAL_NOT_DECISION,
     POLICY_IMPLEMENTATION_MISMATCH, INCOMPARABLE_OBSERVATIONS, NO_EXPLICIT_CHANGE,
-    EXPIRED, NOT_YET_EFFECTIVE, REPLACEMENT_WITHDRAWN, REPLACEMENT_UNRESOLVED,
+    EXPIRED, NOT_YET_EFFECTIVE, REPLACEMENT_SCHEDULED, REPLACEMENT_WITHDRAWN,
+    REPLACEMENT_UNRESOLVED,
     RETIRED_NO_SUCCESSOR, SUPPORT_WITHDRAWN, SUPPORT_DISPROVEN, NO_ELIGIBLE_EVIDENCE,
     UNDATED, KIND_UNKNOWN_REASON, SCOPE_DISJOINT, COVERAGE_PARTIAL, INDEX_STALE,
     LINEAGE_UNKNOWN,
@@ -271,6 +291,11 @@ class ClaimFacts:
     #: Lifecycle state and the signal that decided it (:mod:`.lifecycle`).
     state: str = "unmarked"
     state_reason: str = "unmarked"
+    #: Retired by *location* — the record sits under ``archive/``. Carried
+    #: separately because a declared retirement outranks the path rule and so
+    #: hides it from :attr:`state_reason`
+    #: (:attr:`palinode.core.lifecycle.Eligibility.by_path`).
+    retired_by_path: bool = False
 
     @property
     def retired(self) -> bool:
@@ -370,6 +395,7 @@ def claim_facts(
         declared_at=parse_moment(fm.get("date")),
         state=elig.state,
         state_reason=elig.reason,
+        retired_by_path=elig.by_path,
     )
 
 
@@ -692,6 +718,85 @@ def _future(facts: ClaimFacts, now: datetime) -> bool:
     return facts.declared_at is not None and facts.declared_at > now
 
 
+#: Retiring ``status`` / ``lifecycle`` values that are the bookkeeping half of
+#: a supersession rather than a statement about the record itself: the archive
+#: op stamps ``archived`` beside the ``superseded_by`` it writes, and a
+#: hand-written retirement uses the legacy ``superseded``. ``retracted`` (shown
+#: false) and ``deprecated`` (do not use this) are claims about *this* record,
+#: so neither is ever read as "retired only because something replaces it".
+_SUPERSESSION_STATUSES: frozenset[str] = frozenset({"archived", "superseded"})
+
+
+def _retired_only_by(facts: ClaimFacts, successor: ClaimFacts, now: datetime) -> bool:
+    """Is the pending supersession by ``successor`` the *only* thing retiring ``facts``?
+
+    The question a scheduled replacement turns on. The executor tombstones a
+    record the moment its successor is written, so a successor dated forward
+    leaves a store that says two things: this record is retired, and the thing
+    replacing it does not apply until later. Reading the retirement as
+    scheduled is only honest when the supersession is all there is to it —
+    every other retiring signal is a statement the record makes on its own
+    account and outlives any successor:
+
+    * ``expires_at`` in the past — it ran out on its own clock,
+    * ``retracted`` / ``deprecated`` — shown false, or withdrawn from use,
+    * a path under ``archive/`` — moved out of the live corpus, whatever the
+      frontmatter still says (:attr:`ClaimFacts.retired_by_path`).
+
+    Any of those, and the answer stays what it was: unknown.
+    """
+    if not facts.superseded_by or not successor.ref:
+        return False
+    if _norm_ref(facts.superseded_by) != _norm_ref(successor.ref):
+        return False
+    if facts.retired_by_path:
+        return False
+    expires = _expires_moment(facts)
+    if expires is not None and expires <= now:
+        return False
+    status = (facts.status or "").lower()
+    return status not in (_RETIRED_STATUSES - _SUPERSESSION_STATUSES)
+
+
+def _pending_predecessor(
+    successor: ClaimFacts, cands: list[_Candidate], now: datetime
+) -> _Candidate | None:
+    """The record a not-yet-effective successor will replace, if exactly one is.
+
+    The other end of the same link. A retired predecessor is out of default
+    recall, so the record a query actually reaches is usually the successor —
+    and it has to answer the same question from that side, or the answer would
+    depend on which end of the link was seeded.
+
+    ``None`` unless exactly one visible record names this successor and is
+    retired by nothing else (:func:`_retired_only_by`): two predecessors
+    merging into one successor do not say which of them still applies, and a
+    guess there is the thing this module does not do.
+    """
+    found = [
+        cand for cand in cands
+        if cand.record is not None
+        and cand.record.relation == "superseded_by"
+        and cand.record.direction == "reverse"
+        and _retired_only_by(cand.facts, successor, now)
+        and not _future(cand.facts, now)
+        and _support_failure(cand.facts, cand.check) is None
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _scheduled(side: Side, successor: ClaimFacts) -> Side:
+    """``side`` with the date its supersession takes effect on it."""
+    moment = successor.declared_at
+    stamp = moment.date().isoformat() if moment else ""
+    return replace(
+        side,
+        qualifiers=tuple(dict.fromkeys(
+            (*side.qualifiers, f"{SUPERSEDED_FROM}:{stamp}")
+        )),
+    )
+
+
 def _forward_chain(seed_ref: str | None, cands: list[_Candidate]) -> list[_Candidate]:
     """The ``superseded_by`` chain from the seed, in hop order."""
     by_via: dict[str, _Candidate] = {}
@@ -836,6 +941,28 @@ def resolve(
             reasons.add(REPLACEMENT_WITHDRAWN)
             return _done(OUTCOME_INSUFFICIENT, current=None, sides=sides)
         if _future(terminal.facts, clock):
+            # The change is dated, and that date has not arrived. Until it
+            # does the replacement has not happened, so the record it will
+            # replace is still the last value in force — but only when that
+            # pending supersession is the *only* thing retiring it, and only
+            # when it is itself effective and still supported. Anything else,
+            # and unknown stays the honest answer.
+            prior = chain[-2] if len(chain) >= 2 else None
+            prior_facts = prior.facts if prior else facts
+            prior_side = prior.side if prior else seed_side
+            prior_check = prior.check if prior else seed_check
+            if (
+                _retired_only_by(prior_facts, terminal.facts, clock)
+                and not _future(prior_facts, clock)
+                and _support_failure(prior_facts, prior_check) is None
+            ):
+                reasons.add(REPLACEMENT_SCHEDULED)
+                return _resolve_standing(
+                    prior_facts, _scheduled(prior_side, terminal.facts), conflicts,
+                    support=support, reasons=reasons,
+                    extra_sides=tuple(s for s in sides if s is not prior_side),
+                    clock=clock,
+                )
             reasons.add(NOT_YET_EFFECTIVE)
             return _done(OUTCOME_INSUFFICIENT, current=None, sides=sides)
         failure = _support_failure(terminal.facts, terminal.check)
@@ -857,6 +984,19 @@ def resolve(
         reasons.add(EXPIRED if facts.state_reason == "expired" else RETIRED_NO_SUCCESSOR)
         return _done(OUTCOME_INSUFFICIENT, current=None, sides=(seed_side,))
     if _future(facts, clock):
+        # This record *is* the scheduled change. Until its date arrives the
+        # record it will replace is still the last value in force — the same
+        # rule as the chain branch above, reached from the other end of the
+        # link, which is the end a query usually reaches: the predecessor is
+        # retired and therefore out of default recall.
+        prior = _pending_predecessor(facts, replacements, clock)
+        if prior is not None:
+            reasons.add(REPLACEMENT_SCHEDULED)
+            return _resolve_standing(
+                prior.facts, _scheduled(prior.side, facts), conflicts,
+                support=support, reasons=reasons, extra_sides=(seed_side,),
+                clock=clock,
+            )
         reasons.add(NOT_YET_EFFECTIVE)
         return _done(OUTCOME_INSUFFICIENT, current=None, sides=(seed_side,))
 
@@ -973,6 +1113,7 @@ __all__ = [
     "OUTCOME_INSUFFICIENT",
     "OUTCOME_SUPPORTED",
     "REASONS",
+    "SUPERSEDED_FROM",
     "ClaimFacts",
     "Resolution",
     "Side",

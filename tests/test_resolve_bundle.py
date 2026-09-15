@@ -25,6 +25,7 @@ import json
 import math
 import re
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -45,6 +46,7 @@ from palinode.core.bundle import (
     build_bundle,
 )
 from palinode.core.config import config
+from palinode.core.resolution import SUPERSEDED_FROM
 from palinode.core.receipt import (
     CONFLICT_SIDE,
     EVIDENCE_ONLY,
@@ -252,6 +254,55 @@ def test_current_state_selects_the_replacement(mem):
     assert data["receipt_ref"] == data["receipt"]["bundle_id"]
 
 
+def test_a_scheduled_replacement_answers_with_the_value_still_in_force(mem):
+    """A scheduled change at the surface: the old value, and when it changes.
+
+    Seeded through the shipping SUPERSEDE path, which tombstones the
+    predecessor immediately — the successor's own ``date`` is the only thing
+    that says the change has not happened yet.
+    """
+    from palinode.consolidation.archive import archive_memory
+
+    _write(mem, "decisions/ratelimit.md",
+           "# Rate limit\n\nThe demo API rate limit is 100 requests per minute.",
+           type="Decision", status="active", date="2026-01-20",
+           entities=["project/demo"])
+    _write(mem, "decisions/ratelimit-v2.md",
+           "# Rate limit from January\n\nThe demo API rate limit is 500 requests "
+           "per minute.",
+           type="Decision", status="active", date="2027-01-01",
+           entities=["project/demo"])
+    result = archive_memory("decisions/ratelimit.md", reason="raised from January",
+                            superseded_by="decisions/ratelimit-v2")
+    assert result["status"] == "archived", result
+    _reindex(mem, "decisions/ratelimit.md")
+
+    data = build_bundle(
+        BundleRequest(query="demo API rate limit"),
+        now=datetime(2026, 9, 12, tzinfo=UTC),
+    ).to_dict()
+
+    assert "decisions/ratelimit" in {s["ref"] for s in data["selected"]}
+    current = next(s for s in data["selected"] if s["ref"] == "decisions/ratelimit")
+    assert "100 requests per minute" in current["statement"]
+    assert "replacement_scheduled" in current["reasons"]
+    assert f"{SUPERSEDED_FROM}:2027-01-01" in current["qualifiers"]
+    # The stamp keeps the record's own word and says when it becomes true,
+    # rather than reading as settled or as already retired.
+    line = _line_for(data["text"], "decisions/ratelimit")
+    assert "[retired from 2027-01-01" in line, line
+    assert "500 requests per minute" not in line
+    # The successor points forward, never backwards: the record still standing
+    # did not replace the thing that is about to replace it.
+    assert current["refs"]["superseded_by"] == ["decisions/ratelimit-v2"]
+    assert current["refs"]["replaces"] == []
+    assert data["replaced"] == []
+    assert "    superseded by: decisions/ratelimit-v2" in data["text"]
+    supplied = {r["ref"]: r for r in data["receipt"]["supplied"]}
+    assert supplied["decisions/ratelimit"]["disposition"] == SELECTED
+    assert supplied["decisions/ratelimit-v2"]["disposition"] == EVIDENCE_ONLY
+
+
 def test_a_held_ref_resolves_to_its_successor(mem):
     """The stale ref a caller is carrying is reported replaced, with its successor."""
     seed_current(mem)
@@ -261,6 +312,11 @@ def test_a_held_ref_resolves_to_its_successor(mem):
     assert [r["ref"] for r in data["replaced"]] == ["decisions/endpoint"]
     assert data["replaced"][0]["successor"] == "decisions/endpoint-v2"
     assert data["selected"][0]["refs"]["replaces"] == ["decisions/endpoint"]
+    # An exact-ref seed reads through the same parsed load as every other
+    # record, so its statement is the body — not the file's frontmatter.
+    assert data["replaced"][0]["statement"] == (
+        "Production serves traffic from endpoint alpha."
+    )
 
 
 def test_conflict_keeps_both_sides(mem):
@@ -400,6 +456,64 @@ def test_a_traversing_ref_is_refused(mem):
     data = build_bundle(BundleRequest(ref="../../etc/passwd")).to_dict()
     assert data["selected"] == [] and data["insufficient"] == []
     assert "target_missing" in data["coverage"]["reasons"]
+
+
+# ── index lag: the index chooses the seed, the file supplies the text ────────
+
+
+def _edit_without_reindexing(mem, rel: str, old: str, new: str) -> None:
+    """Real index lag: the file moves on, the watcher has not caught up."""
+    path = mem / rel
+    raw = path.read_text(encoding="utf-8")
+    assert old in raw
+    path.write_text(raw.replace(old, new), encoding="utf-8")
+
+
+def test_index_lag_delivers_the_live_wording_not_the_indexed_one(mem):
+    """An honest stamp on wrong text is still wrong text.
+
+    Nothing is mocked: the file is written and indexed, then edited on disk
+    with no reconcile, so the seed genuinely comes back from an index that
+    lags its source.
+    """
+    _write(mem, "decisions/retention.md",
+           "# Retention\n\nThe demo log retention window is 7 days.",
+           type="Decision", status="active", date="2026-08-01",
+           entities=["project/demo"])
+    _edit_without_reindexing(mem, "decisions/retention.md", "7 days", "30 days")
+
+    data = _bundle("demo log retention window")
+
+    assert [s["ref"] for s in data["selected"]] == ["decisions/retention"]
+    current = data["selected"][0]
+    assert current["freshness"] == "stale", "the seed must really be lagging"
+    assert "index_lag" in data["coverage"]["reasons"]
+    assert "30 days" in current["statement"], current["statement"]
+    assert "7 days" not in data["text"], data["text"]
+    assert "30 days" in data["text"]
+
+
+def test_index_lag_names_the_revision_the_delivered_text_came_from(mem):
+    """The revision on the receipt is the one the excerpt was read at.
+
+    Under lag the indexed per-section hash no longer describes anything that
+    was delivered, so the row names the file it was read from instead — the
+    ``file_sha256`` domain the evidence layer already hashes into.
+    """
+    _write(mem, "decisions/retention.md",
+           "# Retention\n\nThe demo log retention window is 7 days.",
+           type="Decision", status="active", date="2026-08-01",
+           entities=["project/demo"])
+    _edit_without_reindexing(mem, "decisions/retention.md", "7 days", "30 days")
+
+    data = _bundle("demo log retention window")
+    supplied = {r["ref"]: r for r in data["receipt"]["supplied"]}
+    row = supplied["decisions/retention"]
+    assert row["freshness"] == "stale"
+    assert row["revision_basis"] == REVISION_FILE
+    assert row["revision"] == hashlib.sha256(
+        (mem / "decisions" / "retention.md").read_text(encoding="utf-8").encode()
+    ).hexdigest()
 
 
 # ── what the rendered text carries (the string the hook injects) ─────────────

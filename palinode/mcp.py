@@ -1293,9 +1293,17 @@ def _all_tools() -> list[types.Tool]:
                     "update_policy": {
                         "type": "string",
                         "enum": ["append", "replace"],
-                        # append is episodic; replace marks a sticky living
-                        # document protected from history-forking compaction.
-                        "description": "Save behavior: append episodic memory or replace a living document.",
+                        # Both halves are real now: append composes a new body
+                        # out of the old one; replace overwrites AND marks a
+                        # sticky living document protected from history-forking
+                        # compaction.
+                        # Kept terse on purpose: this schema is 86 B under a
+                        # client cap that silently drops an over-budget tool
+                        # (see tests/test_mcp_schema_size_budget.py).
+                        "description": (
+                            "Re-save to same slug: 'append' keeps the existing body and adds "
+                            "below it; 'replace' overwrites and marks a living doc. Sticky."
+                        ),
                     },
                     "sources": {
                         "type": "array",
@@ -2449,9 +2457,16 @@ async def _tool_save(arguments: dict[str, Any]) -> list[types.TextContent]:
     else:
         # Graceful compatibility with an older API server.
         outcome_text = None
-    confirmation = f"Saved to {rel}"
-    if outcome_text:
-        confirmation += f" ({outcome_text})"
+    if save_outcome == "appended":
+        # An append is a different act from a save, and the receipt says so in
+        # the verb rather than in a parenthetical: the caller that lost a body
+        # to `update_policy: append` read "(replaced)" as a status line and not
+        # as a report that their prior content was gone.
+        confirmation = f"Appended to {rel}"
+    else:
+        confirmation = f"Saved to {rel}"
+        if outcome_text:
+            confirmation += f" ({outcome_text})"
     if warnings:
         confirmation += f" [warnings: {'; '.join(warnings)}]"
     return _text(confirmation)

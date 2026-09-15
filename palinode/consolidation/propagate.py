@@ -14,9 +14,9 @@ What propagation does, and does not do:
 - **Flags, never rewrites.** Each dependent gains one ``stale_backing`` entry in
   its frontmatter naming the source ref, the retirement kind, the retired fact
   ids, the reason, and a timestamp. The body is untouched, ``status`` is
-  untouched — the dependent stays live in recall, now visibly contested. The
-  LLM never writes this; it is produced by the deterministic path (the executor
-  and the on-demand archive/retract ops) and committed with provenance.
+  untouched — the dependent stays live in recall, now visibly contested. This is
+  produced by the deterministic path (the executor and the on-demand
+  archive/retract ops) and committed with provenance.
 - **One hop.** Dependents of dependents are not walked. A flagged dependent is
   input to the next consolidation pass, which may retire *it*, and only then
   do its own dependents get flagged.

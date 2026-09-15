@@ -329,15 +329,21 @@ is a marketing page.
   calls for the predecessor to remain applicable until the transition; the
   shipped policy retires it when the successor is written and then declines
   because the successor is not yet effective. A correct refusal, not the required
-  result. **Deferred to v0.21.**
+  result. Deferred at the time of writing; **fixed in v0.20.1** (2026-09-14).
+  The acceptance numbers above come from the run that found it and were not
+  re-measured, so they under-report a fixed build rather than over-report it.
 - **Under index lag the resolved arms deliver the indexed wording.** The delivery
   is honest — it is stamped `index stale` — but a rule-following reader still
   takes the stale value. The only arm that gets this right is the one that reads
-  the file, which gets everything else wrong. **Deferred to v0.21.**
+  the file, which gets everything else wrong. Deferred at the time of writing;
+  **fixed in v0.20.1** (2026-09-14) — the seed now reads through the same live,
+  projected load as every other layer. Not re-measured, for the reason above.
 - **As-of and claim-validity questions are not answered at all**, and are not
   claimed to be. The family is recorded with a deferred disposition and scored by
-  nothing. **Deferred to v0.21** along with the actionability axis and the
-  queryable injection ledger.
+  nothing. **Deferred**, along with the actionability axis and the queryable
+  injection ledger — all three were rescheduled to v0.22.0 on 2026-09-13, since
+  each adds a schema axis or table with its own migration decision and they are
+  better decided as one story.
 - **No statement is made about semantic paraphrase recall.** The seed stage ran
   on a lexical stand-in embedder.
 

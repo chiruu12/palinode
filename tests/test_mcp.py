@@ -293,6 +293,10 @@ async def test_dispatch_save_renders_server_rel_path(monkeypatch):
             "target",
             "Saved to decisions/target.md (disambiguated from target)",
         ),
+        # An append gets its own verb rather than a parenthetical: a caller who
+        # asked for `update_policy: append` must be able to tell from the reply
+        # whether the prior body survived, and "(replaced)" read as a status.
+        ("appended", None, "Appended to decisions/target.md"),
     ],
 )
 @pytest.mark.asyncio

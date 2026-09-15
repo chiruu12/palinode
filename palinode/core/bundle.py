@@ -142,6 +142,8 @@ from palinode.core.resolution import (
     OUTCOME_CONFLICT,
     OUTCOME_INSUFFICIENT,
     OUTCOME_SUPPORTED,
+    REPLACEMENT_SCHEDULED,
+    SUPERSEDED_FROM,
     Resolution,
     Side,
     resolve,
@@ -298,7 +300,10 @@ class Selected:
     reasons: tuple[str, ...]
     #: ``replaces`` / ``support`` / ``seeds`` — where a follow-up read goes.
     #: ``support`` carries the linked backing *and* the unlinked records
-    #: discovery found, which is the shape this payload shipped with.
+    #: discovery found, which is the shape this payload shipped with. A record
+    #: standing until a dated replacement arrives also carries
+    #: ``superseded_by``: the successor that takes over, present only for that
+    #: case and pointing forward, never at history.
     refs: dict[str, list[str]]
     #: Sides considered that did not stand and were not retired — an unaccepted
     #: proposal beside the decision it did not displace. Refs and kind only.
@@ -654,13 +659,27 @@ def _views(
     rows: list[dict[str, Any]],
     seeds: list[SeedEvidence],
 ) -> dict[str, _View]:
-    """One view per ref the bundle can mention: seeds first, then records."""
+    """One view per ref the bundle can mention: seeds first, then records.
+
+    Every excerpt is the **file's** current text. The index chooses which
+    records this bundle is about; it does not supply their wording, because
+    when the index lags its source the two are different text and only one of
+    them is what the record says. A stamp saying ``index stale`` beside the
+    superseded wording is an honest label on the wrong answer, so
+    the seed reads from the same live, projected load every other record's
+    excerpt already came from. The row's own indexed text is the fallback for
+    a seed whose file could not be read at all.
+    """
     out: dict[str, _View] = {}
     for row, seed in zip(rows, seeds, strict=True):
         if not seed.seed_ref:
             continue
         rel = _rel_of_ref(seed.seed_ref)
-        body = project_current_text(str(row.get("content") or "")).text
+        body = (
+            seed.seed_text
+            if seed.seed_text is not None
+            else project_current_text(str(row.get("content") or "")).text
+        )
         title = _title_of(seed.seed_meta or {}, body)
         out[seed.seed_ref] = _View(
             ref=seed.seed_ref,
@@ -737,12 +756,20 @@ def _assemble(
             current = resolution.current
             key = current.ref or seed_ref
             # Sides other than the one standing: those on the replacement
-            # chain are history (`replaced`), the rest stood against it.
+            # chain are history (`replaces`), the rest stood against it.
             history = [s for s in resolution.sides if s.ref in chain_records or s.ref == seed_ref]
             others = [
                 s for s in resolution.sides
                 if s.ref != current.ref and s not in history
             ]
+            # A scheduled replacement runs the other way: the record standing
+            # is the *predecessor*, and the linked side is what will replace
+            # it on the date in its stamp. Calling that "replaces" would read
+            # backwards — the successor is a pointer forward, not history.
+            scheduled_by: list[str] = []
+            if REPLACEMENT_SCHEDULED in resolution.reasons:
+                scheduled_by = [s.ref for s in history if s.ref and s.ref != current.ref]
+                history = []
             if EXPLICIT_REPLACEMENT in resolution.reasons:
                 for side in history:
                     if side.ref and side.ref not in replaced:
@@ -757,6 +784,8 @@ def _assemble(
                 "support": _support_refs(seed),
                 "seeds": [seed_ref] if seed_ref else [],
             }
+            if scheduled_by:
+                refs["superseded_by"] = scheduled_by
             found = _discoveries(seed, views)
             if existing is None:
                 selected[key] = Selected(
@@ -771,8 +800,10 @@ def _assemble(
                 )
             else:
                 merged = {
-                    k: list(dict.fromkeys([*existing.refs.get(k, []), *refs[k]]))
-                    for k in refs
+                    k: list(dict.fromkeys(
+                        [*existing.refs.get(k, []), *refs.get(k, [])]
+                    ))
+                    for k in dict.fromkeys([*existing.refs, *refs])
                 }
                 by_ref = {d.ref: d for d in (*existing.discovered, *found)}
                 selected[key] = Selected(
@@ -901,7 +932,11 @@ def _unit_refs(kind: str, unit: Any) -> tuple[str, ...]:
     """The source pointers a unit carries into the packer's contested stub."""
     if kind == "selected":
         return tuple(
-            r for r in (unit.assertion.ref, *(unit.refs.get("replaces") or ())) if r
+            r for r in (
+                unit.assertion.ref,
+                *(unit.refs.get("replaces") or ()),
+                *(unit.refs.get("superseded_by") or ()),
+            ) if r
         )
     if kind == "conflict":
         return tuple(unit.refs)
@@ -1098,7 +1133,18 @@ def _frame_chars(query: str | None, ref: str | None, *, contested: bool) -> int:
 
 
 def _stamp(a: Assertion) -> str:
-    bits = [a.currency]
+    """``[currency · index stale · date]`` — what a reader sees before the text.
+
+    A record whose supersession is dated forward carries the date in its
+    currency instead of losing it: ``retired from 2027-01-01`` says the same
+    word the frontmatter does *and* says that it is not true yet, which a bare
+    ``retired`` under a ``Current:`` heading does not.
+    """
+    scheduled = next(
+        (q.split(":", 1)[1] for q in a.qualifiers if q.startswith(f"{SUPERSEDED_FROM}:")),
+        None,
+    )
+    bits = [f"{a.currency} from {scheduled}" if scheduled else a.currency]
     if a.freshness == "stale":
         bits.append("index stale")
     if a.effective_at:
@@ -1160,6 +1206,11 @@ def _render_selected(item: Selected) -> list[str]:
     replaces = item.refs.get("replaces") or []
     if replaces:
         lines.append(f"    replaces: {', '.join(replaces)}")
+    # The record that takes over on the date already in the stamp. Named so a
+    # reader can go and see what is coming, not as history.
+    scheduled_by = item.refs.get("superseded_by") or []
+    if scheduled_by:
+        lines.append(f"    superseded by: {', '.join(scheduled_by)}")
     for alt in item.alternatives:
         lines.append(f"    not accepted: {alt['ref']} ({alt['kind']})")
     # The linked half of ``refs["support"]`` by ref; the unlinked half gets a
@@ -1300,6 +1351,10 @@ def _delivered(packed: _Packed) -> list[tuple[str, str, str]]:
     for item in packed.selected:
         for ref in item.refs.get("replaces") or ():
             add(ref, REPLACED, "replaces")
+        # A successor that has not taken effect yet was supplied as context,
+        # not as a record that was replaced.
+        for ref in item.refs.get("superseded_by") or ():
+            add(ref, EVIDENCE_ONLY, "superseded_by")
         for alt in item.alternatives:
             add(alt.get("ref"), CONFLICT_SIDE, "alternative")
         for ref in item.refs.get("support") or ():
@@ -1323,6 +1378,15 @@ def _receipt_rows(
     otherwise the whole-file hash the evidence layer took when it read the
     file — two different domains, which is exactly why each row names the one
     its revision came from. A record in neither reports ``unknown``.
+
+    One case inverts that order: **index lag**. A row stamped ``stale`` is one
+    whose indexed hash no longer describes the file, and the text this bundle
+    delivered came from the file — so the receipt names the file
+    revision it was read at rather than an indexed one that describes nothing
+    that was supplied. ``source_revisions`` stays in the index domain
+    throughout: it is a change-detection token with no basis field to say
+    which domain it is in, and a silently mixed one could not be compared at
+    all.
     """
     rows: list[dict[str, Any]] = []
     for ref, disposition, section in _delivered(packed):
@@ -1330,9 +1394,12 @@ def _receipt_rows(
         view = views.get(ref)
         revision = revisions.get(rel)
         basis = REVISION_INDEX_SECTION
-        if not revision:
-            revision = file_hashes.get(ref)
-            basis = REVISION_FILE if revision else REVISION_UNKNOWN
+        if not revision or (view is not None and view.freshness == "stale"):
+            from_file = file_hashes.get(ref)
+            if from_file:
+                revision, basis = from_file, REVISION_FILE
+            elif not revision:
+                basis = REVISION_UNKNOWN
         rows.append({
             "rel_path": rel,
             "content_hash": revision,
@@ -1391,6 +1458,8 @@ def build_bundle(
     for seed in evidence.seeds:
         if seed.seed_ref and seed.seed_meta is not None:
             metas.setdefault(seed.seed_ref, seed.seed_meta)
+        if seed.seed_ref and seed.seed_content_hash:
+            file_hashes.setdefault(seed.seed_ref, seed.seed_content_hash)
         for rec in seed.records():
             metas.setdefault(rec.ref, rec.meta)
             currencies.setdefault(rec.ref, rec.currency)
@@ -1420,6 +1489,7 @@ def build_bundle(
     for item in packed.selected:
         mentioned.append(item.assertion.ref or "")
         mentioned.extend(item.refs.get("replaces") or [])
+        mentioned.extend(item.refs.get("superseded_by") or [])
     mentioned.extend(r.assertion.ref or "" for r in packed.replaced)
     mentioned.extend(s.ref or "" for g in packed.conflicts for s in g.sides)
     mentioned.extend(i.ref or "" for i in packed.insufficient)

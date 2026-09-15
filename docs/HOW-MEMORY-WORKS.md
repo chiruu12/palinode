@@ -179,7 +179,13 @@ After core injection, Palinode searches for context relevant to **what you just 
   observation of the running system is reported as a
   `policy_implementation_mismatch` rather than silently settled; two observations
   that cannot both hold stay contested; and when a replacement is itself withdrawn
-  the answer is `insufficient_evidence`, never the value it replaced. Claims are
+  the answer is `insufficient_evidence`, never the value it replaced. A replacement
+  the writer **dated forward** has not happened yet: until that date the record it
+  will replace is still the answer (`replacement_scheduled`), carrying
+  `superseded_from:<date>` so nobody is handed a value that is about to change
+  without being told when — and only when that pending supersession is the whole of
+  its retirement. A predecessor that also lapsed, was retracted or deprecated on its
+  own account, or sits under `archive/` stays `insufficient_evidence`. Claims are
   classified from the existing vocabulary only (`type`, `epistemic`, `status`) into
   proposal / accepted intent / observation / inference, and a legacy record that
   declares none of them stays `unknown` and `undated` — nothing invents a date, a

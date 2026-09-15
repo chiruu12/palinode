@@ -34,6 +34,26 @@ _CATEGORY_TO_ENTITY_PREFIX: dict[str, str] = {
 
 _WIKI_FOOTER_MARKER = "<!-- palinode-auto-footer -->"
 
+#: Matches an auto-footer block up to end-of-string or the next level-2
+#: heading. Module-level so ``_apply_wiki_footer`` and ``strip_wiki_footer``
+#: share one pattern — an append composes a new body out of an existing one,
+#: and the two must agree on what a footer block *is* or a stale footer gets
+#: stranded mid-document.
+_AUTO_FOOTER_RE = re.compile(
+    r"## See also\s*\n" + re.escape(_WIKI_FOOTER_MARKER) + r".*?(?=\n## |\Z)",
+    re.DOTALL,
+)
+
+#: Opening of the marker that tags a block ``update_policy: append`` added to
+#: an existing document; the full marker closes with the append's timestamp
+#: (see :func:`append_block_marker`). An HTML comment, so it is invisible in
+#: rendered markdown but greppable, and it sits *under* an H2 heading rather
+#: than replacing it: the indexer splits bodies on H2/H3
+#: (``core/parser.py::parse_markdown``), so the heading is what gives each
+#: appended block its own chunk instead of growing the last one without bound.
+#: Same heading-plus-marker shape the wiki footer already uses.
+APPEND_BLOCK_MARKER_PREFIX = "<!-- palinode-append"
+
 # Slugs are validated before being emitted as ``[[slug]]`` markdown wikilinks.
 # Allow alphanumerics, underscore, hyphen, and dot (some legacy slugs include
 # version-style dots, e.g. ``palinode-0.5.0``). Forbid ``[``, ``]``, ``|``,
@@ -79,18 +99,11 @@ def _apply_wiki_footer(content: str, entities: list[str]) -> str:
     if not content or not entities:
         return content
 
-    # Pattern that matches an existing auto-footer block up to end-of-string or
-    # the next level-2 heading.  Compiled once; used twice below.
-    auto_footer_re = re.compile(
-        r"## See also\s*\n" + re.escape(_WIKI_FOOTER_MARKER) + r".*?(?=\n## |\Z)",
-        re.DOTALL,
-    )
-
     # Scan for existing inline wikilinks OUTSIDE the auto-footer block so that
     # links inside the footer itself are not mistaken for user-authored inline
     # links.  This is the key to idempotency: on re-save the footer's own
     # [[slug]] entries do not satisfy the "already linked inline" check.
-    body_for_scan = auto_footer_re.sub("", content)
+    body_for_scan = _AUTO_FOOTER_RE.sub("", content)
     existing_links: set[str] = set(re.findall(r"\[\[([^\]]+)\]\]", body_for_scan))
 
     # Derive the wikilink slug for each entity (part after the last '/').
@@ -119,17 +132,72 @@ def _apply_wiki_footer(content: str, entities: list[str]) -> str:
     else:
         new_footer = ""
 
-    if auto_footer_re.search(content):
+    if _AUTO_FOOTER_RE.search(content):
         if new_footer:
-            content = auto_footer_re.sub(new_footer, content)
+            content = _AUTO_FOOTER_RE.sub(new_footer, content)
         else:
             # All links are now inline — strip the stale auto-footer.
-            content = auto_footer_re.sub("", content).rstrip("\n") + "\n"
+            content = _AUTO_FOOTER_RE.sub("", content).rstrip("\n") + "\n"
     elif new_footer:
         # No existing auto-footer; append after a blank-line separator.
         content = content.rstrip("\n") + "\n\n" + new_footer
 
     return content
+
+
+def strip_wiki_footer(content: str) -> str:
+    """Remove the auto-generated ``## See also`` block from *content*.
+
+    Only the marked, auto-generated footer is removed; a user-authored
+    ``## See also`` section is left alone (it carries no marker, so the pattern
+    does not match it). Used when composing an append: the prior body's footer
+    belongs at the end of the *composed* document, not stranded in the middle
+    of it, and ``_apply_wiki_footer`` re-emits it there when this save supplies
+    entities.
+    """
+    if not content:
+        return content
+    return _AUTO_FOOTER_RE.sub("", content).rstrip("\n")
+
+
+def append_block_marker(now_iso: str) -> str:
+    """The hidden marker line that opens an appended block."""
+    return f"{APPEND_BLOCK_MARKER_PREFIX} {now_iso} -->"
+
+
+def compose_appended_body(existing_body: str, new_content: str, now_iso: str) -> str:
+    """Join *new_content* onto *existing_body* under a dated append heading.
+
+    The separator is an H2 heading plus :func:`append_block_marker`::
+
+        <existing body>
+
+        ## Update — 2026-09-13
+        <!-- palinode-append 2026-09-13T10:11:12.345678+00:00 -->
+
+        <new content>
+
+    Three properties the shape is chosen for: the H2 is a chunk boundary for
+    ``parse_markdown``, so each appended block is independently retrievable
+    instead of swelling the tail chunk; the heading is ordinary markdown, so
+    the compaction prompt and the fact-id tagger (both of which work over
+    list-item lines, not headings) need no new rules; and the hidden marker
+    carries the exact ``last_updated`` stamp for anything that later wants to
+    tell an appended block from author-written prose.
+
+    *existing_body* is never truncated or rewritten — that is the whole point.
+    Returns *new_content* alone when there is no prior body to append to.
+    """
+    prior = strip_wiki_footer(existing_body or "").rstrip("\n")
+    if not prior.strip():
+        return new_content
+    heading_date = now_iso[:10]
+    return (
+        f"{prior}\n\n"
+        f"## Update — {heading_date}\n"
+        f"{append_block_marker(now_iso)}\n\n"
+        f"{new_content.lstrip()}"
+    )
 
 
 def _normalize_entities(entities: list[str], category: str) -> list[str]:
