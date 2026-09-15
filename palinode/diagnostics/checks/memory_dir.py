@@ -67,7 +67,6 @@ def memory_dir_writable(ctx: DoctorContext) -> CheckResult:
                 f"{memory_dir}"
             ),
             remediation=None,
-            linked_issue="#206",
         )
 
     if os.access(str(memory_dir), os.W_OK | os.X_OK):
@@ -77,7 +76,6 @@ def memory_dir_writable(ctx: DoctorContext) -> CheckResult:
             passed=True,
             message=f"Memory directory is writable: {memory_dir}",
             remediation=None,
-            linked_issue="#206",
         )
 
     return CheckResult(
@@ -96,5 +94,4 @@ def memory_dir_writable(ctx: DoctorContext) -> CheckResult:
             f"  chown $(id -u):$(id -g) {memory_dir}\n"
             f"Or set PALINODE_DIR to a writable path."
         ),
-        linked_issue="#206",
     )
