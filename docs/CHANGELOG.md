@@ -6,6 +6,12 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Added
 
+- `doctor`: new `memory_dir_writable` check. `memory_dir_exists` is critical but only
+  asserts the path is a directory, so a memory directory on a read-only mount, owned by
+  another user, or with its mode tightened by hand reported green while every save failed.
+  The new check tests `os.W_OK | os.X_OK` and carries remediation naming those three
+  causes. ([#206](https://github.com/phasespace-labs/palinode/issues/206))
+
 ### Changed
 
 ### Fixed

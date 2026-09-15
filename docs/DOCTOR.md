@@ -49,6 +49,7 @@ Pure-disk checks. Cheap, no network.
 | Check | Severity ceiling | Catches |
 |---|---|---|
 | `memory_dir_exists` | critical | `PALINODE_DIR` points at a missing or non-directory path |
+| `memory_dir_writable` | critical | `memory_dir` exists but the running user cannot create files in it |
 | `db_path_resolvable` | error | `db_path` parent missing, or the file is not openable as SQLite |
 | `db_path_under_memory_dir` | warn | `db_path` resolves outside `memory_dir` (the rename-drift signature) |
 | `phantom_db_files` | critical | One or more `.palinode.db` files exist outside the configured path |
@@ -57,6 +58,21 @@ Pure-disk checks. Cheap, no network.
 #### `memory_dir_exists`
 
 Verifies `Path(config.memory_dir)` exists and is a directory. Without it nothing else works, so this is the single critical-severity gate. Failure prints the resolved path and the `mkdir -p` command. **Fixable via `--fix`** (creates the directory).
+
+#### `memory_dir_writable`
+
+Verifies the running user can create files in `config.memory_dir`. A directory that exists
+but is not writable passes `memory_dir_exists` and then fails every save, which is what a
+read-only mount, an ownership mismatch, or a hand-tightened mode all look like.
+
+Checks `os.W_OK | os.X_OK`, because creating a file inside a directory needs search
+permission as well as write. Uses `os.access` rather than writing a probe file, matching
+`audit_log_writable`; that is advisory and can disagree with a real write, but doctor should
+not leave files in your memory directory to answer a question.
+
+When `memory_dir` is absent or is not a directory the check passes with a message saying it
+did not apply. `memory_dir_exists` already reports that case and one cause should not
+produce two failures. Not fixable via `--fix`.
 
 #### `db_path_resolvable`
 
