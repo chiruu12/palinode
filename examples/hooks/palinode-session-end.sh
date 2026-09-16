@@ -89,7 +89,7 @@ PROJECT=$(basename "$CWD" 2>/dev/null || echo "unknown")
 # The first user turn is a *topic hint*, not content — and in Claude Code it is
 # routinely wrapped in harness markup (slash-command expansion, system
 # reminders, bash/IDE blocks). Left in, that markup is embedded and indexed as
-# though it were what the session was about (#682). Strip it here, at the
+# though it were what the session was about. Strip it here, at the
 # source: wrapper blocks whose body is machinery lose the whole block; the
 # command-name tags lose only the tags, keeping the human-meaningful text. A
 # `type` guard keeps gsub safe when `content` is a block array rather than a
