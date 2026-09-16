@@ -310,25 +310,28 @@ def _string_constant_refs_in(path: Path) -> list[tuple[int, str]]:
     return found
 
 
-def test_no_issue_refs_in_diagnostics_strings() -> None:
-    """String constants in ``palinode/diagnostics/`` must not carry bare issue refs.
+def test_no_issue_refs_in_package_strings() -> None:
+    """String constants in ``palinode/`` must not carry bare issue refs.
 
-    Scoped strictly to ``palinode/diagnostics/``: diagnostic check results and
-    remediation messages are surfaced directly to the user during health
-    checks, so unfollowable private issue references in string constants or
-    check-linked issues mislead users or link to unrelated issues on the public
-    tracker.
+    This started scoped to ``palinode/diagnostics/``, where remediation text is
+    printed straight at the user during a health check. That is the loudest
+    case, not the only one: an assertion message, a CLI warning, and the
+    ``/wrap`` command body rendered into a user's repo are all string constants
+    outside ``diagnostics/`` that a reader sees and cannot follow.
+
+    ``tests/`` stays out. Test strings are fixtures and assertion prose for
+    contributors, not shipped user-facing text, and the pinned cases at the
+    bottom of this file quote bare tags on purpose.
     """
     repo_root = Path(__file__).resolve().parent.parent
     offenders: list[str] = []
-    diag_root = repo_root / "palinode" / "diagnostics"
-    for py in sorted(diag_root.rglob("*.py")):
+    for py in sorted((repo_root / "palinode").rglob("*.py")):
         for line, text in _string_constant_refs_in(py):
             rel = py.relative_to(repo_root)
             offenders.append(f"  {rel}:{line}: {_issue_refs(text)}  →  {text.strip()[:70]}")
 
     assert not offenders, (
-        "Unfollowable issue refs found in diagnostics string constants. A bare "
+        "Unfollowable issue refs found in package string constants. A bare "
         "number cannot be followed by a public reader — use the full public issue "
         "URL, or name the change instead:\n" + "\n".join(offenders)
     )

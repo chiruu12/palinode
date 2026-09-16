@@ -229,7 +229,7 @@ PROJECT=$(basename "$CWD" 2>/dev/null || echo "unknown")
 # The first user turn is a *topic hint*, not content — and in Claude Code it is
 # routinely wrapped in harness markup (slash-command expansion, system
 # reminders, bash/IDE blocks). Left in, that markup is embedded and indexed as
-# though it were what the session was about (#682). Strip it here, at the
+# though it were what the session was about. Strip it here, at the
 # source: wrapper blocks whose body is machinery lose the whole block; the
 # command-name tags lose only the tags, keeping the human-meaningful text. A
 # `type` guard keeps gsub safe when `content` is a block array rather than a
@@ -765,7 +765,7 @@ Before archiving, glance at the *working repo's* git state — the code repo you
 were editing, not the Palinode memory repo (Steps 1–2 handle that). This is a
 light courtesy check, **not** the heavy wrap's halt-on-failure merge sequence:
 you **offer** to close things out, you never commit, merge, or push without an
-explicit yes in this session (#618).
+explicit yes in this session.
 - Run `git status --short`. If on a feature branch, also check whether it is
   ahead of `main` — e.g. `git log --oneline main..HEAD`.
 - **Clean tree and not ahead of `main`?** Say nothing and go straight to
@@ -783,7 +783,7 @@ explicit yes in this session (#618).
 Call `palinode_push` to sync any commits already on the branch to the remote
 before the session is archived — a session end is a natural sync point; don't
 strand local commits, and prior work stays safe even if the archive step is
-interrupted (#353). If the push succeeds, continue. If it fails because there
+interrupted. If the push succeeds, continue. If it fails because there
 is no remote configured, print: `(no remote configured — skipping push)` and
 continue. If it fails for any other reason (conflict, auth, network), print the
 error and ask the user whether to proceed or abort.
@@ -806,7 +806,7 @@ approach" is unreadable once the list is gone.
 
 This writes and commits the daily note, the project status line, and an
 individual indexed memory file, then — because of `push: true` — pushes the
-memory repo so the note actually reaches the remote (#378). Without `push: true`
+memory repo so the note actually reaches the remote. Without `push: true`
 the note only pushes when `config.git.auto_push` is on (default: off), which is
 how the final session before a gap used to end up stranded. Do not save as a
 ProjectSnapshot first — this command is exclusively for structured wrap-ups.
@@ -897,7 +897,7 @@ record captures the post-merge SHAs, the freshly-filed issue numbers, and the
 papercut/INBOX updates — reference *what the wrap did* (merged #X, pushed Y,
 filed #Z, appended N items), not just the work. `push: true` ships the note in
 the same call — the note is committed *after* Step 2's push, so without it the
-session record would sit unpushed despite a "heavy" wrap (#378).
+session record would sit unpushed despite a "heavy" wrap.
 - If Palinode is unreachable: **continue** — print a warning and emit a stub
   markdown block the operator can save manually later. Ending without a
   Palinode record is acceptable; silently skipping with no warning is not.

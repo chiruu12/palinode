@@ -382,7 +382,7 @@ assert _SESSION_END_TIMEOUT == _SENTINEL or os.environ.get(
 ), (
     f"SESSION_END_TIMEOUT_SECONDS ({_SESSION_END_TIMEOUT}) differs from sentinel "
     f"({_SENTINEL}) without PALINODE_SESSION_END_TIMEOUT override — "
-    "update mcp.py or defaults.py to stay in sync (#377)"
+    "update mcp.py or defaults.py to stay in sync"
 )
 
 def _client_headers() -> dict[str, str]:

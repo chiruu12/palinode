@@ -581,7 +581,8 @@ def mcp_config(
         console.print("[bold red]WARNING: configs diverge[/bold red]")
         console.print(
             "Multiple files have a 'palinode' entry but they differ.\n"
-            "Editing the wrong one is the silent-failure pattern documented in #189."
+            "Editing the wrong one is the silent-failure pattern documented in "
+            "docs/MCP-CONFIG-HOMES.md."
         )
         console.print()
         for a, b, diff in divergences:

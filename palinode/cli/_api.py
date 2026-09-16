@@ -19,7 +19,7 @@ assert SESSION_END_TIMEOUT_SECONDS == _SESSION_END_TIMEOUT_SENTINEL or os.enviro
 ), (
     f"SESSION_END_TIMEOUT_SECONDS ({SESSION_END_TIMEOUT_SECONDS}) differs from sentinel "
     f"({_SESSION_END_TIMEOUT_SENTINEL}) without PALINODE_SESSION_END_TIMEOUT override — "
-    "update cli/_api.py or defaults.py to stay in sync (#377)"
+    "update cli/_api.py or defaults.py to stay in sync"
 )
 
 # Re-exported for CLI commands that need to catch API errors without
